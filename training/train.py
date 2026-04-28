@@ -1,0 +1,325 @@
+"""
+Training-Pipeline für das CRNN-Modell.
+
+Ablauf pro Epoch:
+  1. Vorwärtsdurchlauf: Bild → Modell → Log-Wahrscheinlichkeiten
+  2. CTC-Loss berechnen
+  3. Rückwärtsdurchlauf (Backpropagation)
+  4. Optimierer-Schritt
+  5. Validierung + Metriken
+  6. Early Stopping prüfen
+  7. Checkpoint speichern (wenn bestes Modell)
+
+Starten mit:
+  python -m training.train --dataset synthetic --epochs 30
+
+Mit IAM-Datensatz:
+  python -m training.train --dataset iam --data-dir data/raw --epochs 100
+"""
+
+import argparse
+import json
+import time
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import torch
+import torch.nn as nn
+from torch.optim import Adam
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+from src.dataset import NUM_CLASSES, get_dataloaders
+from src.model import build_model
+from evaluation.evaluate import compute_cer, decode_batch_labels
+from utils.ctc_decoder import greedy_decode
+from utils.visualization import plot_training_curves
+
+
+# ── Trainer-Klasse ────────────────────────────────────────────────────────────
+
+class Trainer:
+    """
+    Kapselt die gesamte Trainingslogik: Optimizer, Scheduler, Checkpointing,
+    Early Stopping und Logging.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        train_loader: torch.utils.data.DataLoader,
+        val_loader:   torch.utils.data.DataLoader,
+        lr: float = 1e-3,
+        weight_decay: float = 1e-4,
+        patience: int = 10,
+        checkpoint_dir: str = "outputs/checkpoints",
+        log_dir: str = "outputs/logs",
+        device: torch.device = torch.device("cpu"),
+    ) -> None:
+        self.model        = model.to(device)
+        self.train_loader = train_loader
+        self.val_loader   = val_loader
+        self.device       = device
+        self.patience     = patience
+
+        Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        self.checkpoint_dir = checkpoint_dir
+        self.log_dir        = log_dir
+
+        # CTC-Loss: blank_label=0 (Index 0 = '-' in unserem Alphabet)
+        self.criterion = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
+
+        # Adam mit Gewichtszerfall (L2-Regularisierung)
+        self.optimizer = Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+        # Lernrate halbieren wenn Val-Loss über `patience//2` Epochen nicht sinkt
+        self.scheduler = ReduceLROnPlateau(
+            self.optimizer, mode="min", factor=0.5, patience=patience // 2
+        )
+
+        self.writer = SummaryWriter(log_dir=log_dir)
+
+        # Verlaufs-Tracking
+        self.history: Dict[str, List[float]] = {
+            "train_loss": [], "val_loss": [],
+            "train_cer":  [], "val_cer": [],
+        }
+        self.best_val_cer   = float("inf")
+        self.epochs_no_improve = 0
+
+    # ── Haupt-Trainingsschleife ────────────────────────────────────────────────
+
+    def fit(self, epochs: int) -> Dict[str, List[float]]:
+        """
+        Trainiert das Modell für `epochs` Epochen mit Early Stopping.
+
+        Returns:
+            history: Dict mit Loss- und CER-Verläufen
+        """
+        print(f"\nTraining gestartet auf: {self.device}")
+        print(f"Epochen: {epochs}  |  Early-Stopping-Patience: {self.patience}\n")
+
+        for epoch in range(1, epochs + 1):
+            t0 = time.time()
+
+            train_loss, train_cer = self._train_epoch(epoch)
+            val_loss,   val_cer   = self._val_epoch()
+
+            elapsed = time.time() - t0
+
+            # Verlauf speichern
+            self.history["train_loss"].append(train_loss)
+            self.history["val_loss"].append(val_loss)
+            self.history["train_cer"].append(train_cer)
+            self.history["val_cer"].append(val_cer)
+
+            # TensorBoard
+            self.writer.add_scalars("Loss", {"train": train_loss, "val": val_loss}, epoch)
+            self.writer.add_scalars("CER",  {"train": train_cer,  "val": val_cer},  epoch)
+            self.writer.add_scalar("LearningRate", self.optimizer.param_groups[0]["lr"], epoch)
+
+            print(
+                f"Epoch {epoch:03d}/{epochs:03d} | "
+                f"Train Loss: {train_loss:.4f}  CER: {train_cer:.4f} | "
+                f"Val Loss: {val_loss:.4f}  CER: {val_cer:.4f} | "
+                f"LR: {self.optimizer.param_groups[0]['lr']:.2e} | "
+                f"{elapsed:.1f}s"
+            )
+
+            # Learning Rate anpassen
+            self.scheduler.step(val_loss)
+
+            # Bestes Modell speichern
+            if val_cer < self.best_val_cer:
+                self.best_val_cer = val_cer
+                self.epochs_no_improve = 0
+                self._save_checkpoint(epoch, val_cer, is_best=True)
+                print(f"  → Neues bestes Modell gespeichert (CER: {val_cer:.4f})")
+            else:
+                self.epochs_no_improve += 1
+
+            # Regelmäßiger Checkpoint alle 10 Epochen
+            if epoch % 10 == 0:
+                self._save_checkpoint(epoch, val_cer, is_best=False)
+
+            # Early Stopping
+            if self.epochs_no_improve >= self.patience:
+                print(f"\nEarly Stopping nach {epoch} Epochen (keine Verbesserung seit {self.patience} Epochen).")
+                break
+
+        self.writer.close()
+        self._save_history()
+        plot_training_curves(self.history, save_path=f"{self.log_dir}/training_curves.png")
+        return self.history
+
+    # ── Epoch-Funktionen ──────────────────────────────────────────────────────
+
+    def _train_epoch(self, epoch: int) -> Tuple[float, float]:
+        """Trainings-Epoch: Vorwärts- + Rückwärtsdurchlauf für alle Batches."""
+        self.model.train()
+        total_loss = 0.0
+        all_preds:  List[str] = []
+        all_labels: List[str] = []
+
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} Train", leave=False)
+        for images, labels, label_lengths in pbar:
+            images        = images.to(self.device)
+            labels        = labels.to(self.device)
+            label_lengths = label_lengths.to(self.device)
+
+            # Vorwärtsdurchlauf
+            log_probs = self.model(images)  # (SeqLen, Batch, NumClasses)
+
+            # CTC-Loss benötigt: log_probs, labels, input_lengths, target_lengths
+            # input_lengths = Sequenzlänge der CNN-Ausgabe (gleich für alle im Batch)
+            seq_len     = log_probs.size(0)
+            batch_size  = images.size(0)
+            input_lengths = torch.full((batch_size,), seq_len, dtype=torch.long, device=self.device)
+
+            loss = self.criterion(log_probs, labels, input_lengths, label_lengths)
+
+            # Rückwärtsdurchlauf
+            self.optimizer.zero_grad()
+            loss.backward()
+            # Gradient Clipping verhindert explodierende Gradienten in RNNs
+            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+            self.optimizer.step()
+
+            total_loss += loss.item()
+
+            # CER für diesen Batch (nur auf CPU)
+            with torch.no_grad():
+                preds  = greedy_decode(log_probs.detach())
+                truths = decode_batch_labels(labels.cpu(), label_lengths.cpu())
+                all_preds.extend(preds)
+                all_labels.extend(truths)
+
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        avg_loss = total_loss / len(self.train_loader)
+        cer      = compute_cer(all_preds, all_labels)
+        return avg_loss, cer
+
+    def _val_epoch(self) -> Tuple[float, float]:
+        """Validierungs-Epoch: nur Vorwärtsdurchlauf, kein Gradient."""
+        self.model.eval()
+        total_loss = 0.0
+        all_preds:  List[str] = []
+        all_labels: List[str] = []
+
+        with torch.no_grad():
+            for images, labels, label_lengths in tqdm(self.val_loader, desc="  Val", leave=False):
+                images        = images.to(self.device)
+                labels_dev    = labels.to(self.device)
+                label_lengths = label_lengths.to(self.device)
+
+                log_probs = self.model(images)
+                seq_len     = log_probs.size(0)
+                batch_size  = images.size(0)
+                input_lengths = torch.full((batch_size,), seq_len, dtype=torch.long, device=self.device)
+
+                loss = self.criterion(log_probs, labels_dev, input_lengths, label_lengths)
+                total_loss += loss.item()
+
+                preds  = greedy_decode(log_probs)
+                truths = decode_batch_labels(labels, label_lengths.cpu())
+                all_preds.extend(preds)
+                all_labels.extend(truths)
+
+        avg_loss = total_loss / len(self.val_loader)
+        cer      = compute_cer(all_preds, all_labels)
+        return avg_loss, cer
+
+    # ── Hilfsmethoden ─────────────────────────────────────────────────────────
+
+    def _save_checkpoint(self, epoch: int, val_cer: float, is_best: bool) -> None:
+        filename = "best_model.pt" if is_best else f"checkpoint_epoch{epoch:03d}.pt"
+        path = Path(self.checkpoint_dir) / filename
+        torch.save({
+            "epoch":               epoch,
+            "model_state_dict":    self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "val_cer":             val_cer,
+            "history":             self.history,
+        }, path)
+
+    def _save_history(self) -> None:
+        path = Path(self.log_dir) / "history.json"
+        with open(path, "w") as f:
+            json.dump(self.history, f, indent=2)
+        print(f"Verlauf gespeichert: {path}")
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="HTR CRNN Training")
+    parser.add_argument("--dataset",     default="synthetic",     choices=["synthetic", "iam"],
+                        help="Datensatz-Typ (default: synthetic)")
+    parser.add_argument("--data-dir",    default="data/raw",      help="Pfad zum IAM-Datensatz")
+    parser.add_argument("--epochs",      type=int, default=30,    help="Maximale Epochenanzahl")
+    parser.add_argument("--batch-size",  type=int, default=32,    help="Batch-Größe")
+    parser.add_argument("--lr",          type=float, default=1e-3, help="Lernrate")
+    parser.add_argument("--img-height",  type=int, default=32,    help="Bildhöhe")
+    parser.add_argument("--img-width",   type=int, default=128,   help="Bildbreite")
+    parser.add_argument("--lstm-hidden", type=int, default=256,   help="LSTM-Einheiten")
+    parser.add_argument("--patience",    type=int, default=10,    help="Early-Stopping-Patience")
+    parser.add_argument("--workers",     type=int, default=4,     help="DataLoader-Worker")
+    parser.add_argument("--resume",      default=None,            help="Checkpoint zum Fortsetzen")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Gerät: {device}")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    # Daten laden
+    train_loader, val_loader = get_dataloaders(
+        dataset_type=args.dataset,
+        data_dir=args.data_dir,
+        batch_size=args.batch_size,
+        img_height=args.img_height,
+        img_width=args.img_width,
+        num_workers=args.workers,
+    )
+
+    # Modell erstellen
+    model = build_model(
+        img_height=args.img_height,
+        num_classes=NUM_CLASSES,
+        lstm_hidden=args.lstm_hidden,
+    )
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Modell-Parameter: {total_params:,}")
+
+    # Trainer
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        lr=args.lr,
+        patience=args.patience,
+        device=device,
+    )
+
+    # Optional: Training fortsetzen
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        trainer.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        print(f"Training fortgesetzt von: {args.resume}")
+
+    # Training starten
+    trainer.fit(epochs=args.epochs)
+    print("\nTraining abgeschlossen!")
+    print(f"Bestes Modell: outputs/checkpoints/best_model.pt")
+
+
+if __name__ == "__main__":
+    main()

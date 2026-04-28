@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pt
+*.pyc
+data/raw/
+outputs/checkpoints/
+outputs/logs/
+*.zip
+.kaggle/
+AKI_HTA/
