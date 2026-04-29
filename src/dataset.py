@@ -70,12 +70,14 @@ class IAMDataset(Dataset):
         img_height: int = 32,
         img_width: int = 128,
         max_label_len: int = 32,
+        split_mode: str = "random",  # "random" (80/10/10) oder "author" (offizielle IAM-Aufteilung)
     ) -> None:
         self.root_dir = Path(root_dir)
         self.split = split
         self.max_label_len = max_label_len
         self.img_height = img_height
         self.img_width = img_width
+        self.split_mode = split_mode
 
         self.transform = (
             get_train_transforms(img_height, img_width)
@@ -103,29 +105,28 @@ class IAMDataset(Dataset):
                 "https://fki.inf.unibe.ch/databases/iam-handwriting-database"
             )
 
-        # IAM train/val/test Split – offizielle Aufteilung nach Autoren-ID
+        # Alle gültigen Samples laden
+        all_samples: List[Tuple[Path, str]] = []
+
+        # Für author-Split: Autoren-IDs filtern
         TRAIN_AUTHORS = {"a01", "a02", "d01", "d04", "e01", "f07", "g01", "g07"}
         VAL_AUTHORS   = {"a03", "b01", "b02", "c02", "d06"}
         TEST_AUTHORS  = {"a04", "a05", "a06", "b04", "c01", "d02", "d03"}
-
-        split_map = {
-            "train": TRAIN_AUTHORS,
-            "val":   VAL_AUTHORS,
-            "test":  TEST_AUTHORS,
-        }
-        allowed = split_map[self.split]
+        author_split_map = {"train": TRAIN_AUTHORS, "val": VAL_AUTHORS, "test": TEST_AUTHORS}
 
         with open(words_file, encoding="utf-8") as f:
             for line in f:
-                if line.startswith("#"):   # Kommentarzeilen überspringen
+                if line.startswith("#"):
                     continue
                 parts = line.strip().split(" ")
                 if len(parts) < 9 or parts[1] != "ok":
                     continue
 
-                word_id = parts[0]                      # z.B. "a01-000u-00-00"
-                author  = word_id.split("-")[0]          # z.B. "a01"
-                if author not in allowed:
+                word_id = parts[0]
+                author  = word_id.split("-")[0]
+
+                # Bei author-Split: nur erlaubte Autoren laden
+                if self.split_mode == "author" and author not in author_split_map[self.split]:
                     continue
 
                 label = parts[-1]
@@ -134,14 +135,28 @@ class IAMDataset(Dataset):
                 if not all(c in CHAR2IDX for c in label):
                     continue
 
-                # Bildpfad aus ID rekonstruieren — unterstützt words/ und iam_words/words/
                 parts_id = word_id.split("-")
                 rel = Path("words") / parts_id[0] / f"{parts_id[0]}-{parts_id[1]}" / f"{word_id}.png"
                 img_path = words_file.parent / rel
                 if img_path.exists():
-                    self.samples.append((img_path, label))
+                    all_samples.append((img_path, label))
 
-        print(f"IAM [{self.split}]: {len(self.samples)} Samples geladen.")
+        if self.split_mode == "random":
+            # Reproduzierbarer 80/10/10-Split über alle verfügbaren Daten
+            import random as _rnd
+            rng = _rnd.Random(42)
+            rng.shuffle(all_samples)
+            n = len(all_samples)
+            splits = {
+                "train": all_samples[:int(n * 0.80)],
+                "val":   all_samples[int(n * 0.80):int(n * 0.90)],
+                "test":  all_samples[int(n * 0.90):],
+            }
+            self.samples = splits[self.split]
+        else:
+            self.samples = all_samples
+
+        print(f"IAM [{self.split}] ({self.split_mode}): {len(self.samples)} Samples geladen.")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -291,8 +306,8 @@ def get_dataloaders(
         (train_loader, val_loader)
     """
     if dataset_type == "iam":
-        train_ds = IAMDataset(data_dir, split="train", img_height=img_height, img_width=img_width)
-        val_ds   = IAMDataset(data_dir, split="val",   img_height=img_height, img_width=img_width)
+        train_ds = IAMDataset(data_dir, split="train", img_height=img_height, img_width=img_width, split_mode="random")
+        val_ds   = IAMDataset(data_dir, split="val",   img_height=img_height, img_width=img_width, split_mode="random")
     else:
         train_size = int(synthetic_size * 0.85)
         val_size   = synthetic_size - train_size

@@ -87,13 +87,15 @@ def get_train_transforms(img_height: int = 32, img_width: int = 128) -> T.Compos
     return T.Compose([
         T.Grayscale(num_output_channels=1),
         ResizeToHeight(img_height, img_width),
-        T.RandomRotation(degrees=3, fill=255),          # leichte Neigung
-        T.RandomAffine(degrees=0, shear=5, fill=255),   # Scherung
-        T.ColorJitter(brightness=0.3, contrast=0.3),    # Helligkeit/Kontrast
-        RandomDilateErode(prob=0.3),                    # Stiftstärke variieren
-        T.ToTensor(),                                    # [0,255] → [0,1]
-        T.Normalize(mean=[0.5], std=[0.5]),              # [0,1] → [-1,1]
-        AddGaussianNoise(std=0.02),                      # leichtes Rauschen
+        T.RandomRotation(degrees=5, fill=255),                        # Neigung bis 5°
+        T.RandomAffine(degrees=0, shear=8, fill=255),                 # stärkere Scherung
+        T.RandomPerspective(distortion_scale=0.15, p=0.3, fill=255),  # Perspektivverzerrung
+        T.ColorJitter(brightness=0.4, contrast=0.4),                  # Helligkeit/Kontrast
+        RandomDilateErode(prob=0.4),                                   # Stiftstärke variieren
+        T.RandomApply([T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5))], p=0.3),  # Unschärfe
+        T.ToTensor(),
+        T.Normalize(mean=[0.5], std=[0.5]),
+        AddGaussianNoise(std=0.03),                                    # etwas mehr Rauschen
     ])
 
 

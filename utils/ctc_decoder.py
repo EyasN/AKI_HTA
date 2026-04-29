@@ -2,15 +2,17 @@
 CTC-Decoder: wandelt Modellausgaben (Log-Wahrscheinlichkeiten) in lesbaren Text um.
 
 Zwei Varianten:
-  - Greedy Decoder:      schnell, ausreichend für Training und Evaluation
-  - Beam Search Decoder: langsamer, aber besser bei verrauschten Ausgaben
-                         (via torch.nn.CTCLoss-kompatiblem Format)
+  - Greedy Decoder:      schnell, gut für Training und schnelle Evaluation
+  - Beam Search Decoder: langsamer, aber messbar besser bei verrauschten Ausgaben
 """
 
 from typing import List
+import numpy as np
 import torch
 
 from src.dataset import IDX2CHAR, BLANK_TOKEN
+
+BLANK_IDX = 0
 
 
 def greedy_decode(log_probs: torch.Tensor) -> List[str]:
@@ -24,7 +26,6 @@ def greedy_decode(log_probs: torch.Tensor) -> List[str]:
     Returns:
         Liste von dekodierten Strings, eine pro Batch-Element
     """
-    # Argmax über Klassen-Dimension → (SeqLen, Batch)
     predictions = torch.argmax(log_probs, dim=2).permute(1, 0)   # (Batch, SeqLen)
 
     results: List[str] = []
@@ -33,7 +34,6 @@ def greedy_decode(log_probs: torch.Tensor) -> List[str]:
         prev = None
         for idx in seq.tolist():
             char = IDX2CHAR.get(idx, "")
-            # CTC-Regel: Blank ignorieren, Duplikate zusammenführen
             if char != BLANK_TOKEN and char != prev:
                 chars.append(char)
             prev = char
@@ -47,53 +47,60 @@ def beam_search_decode(
     beam_width: int = 10,
 ) -> List[str]:
     """
-    Beam Search CTC-Decoding (vereinfachte Version ohne Sprachmodell).
+    Beam Search CTC-Decoding (ohne Sprachmodell).
 
     Für jedes Batch-Element werden `beam_width` Hypothesen gleichzeitig verfolgt.
-    Am Ende wird die Hypothese mit dem höchsten Score zurückgegeben.
-
-    Hinweis: Für Produktionseinsatz empfiehlt sich die ctcdecode-Bibliothek
-    (https://github.com/parlance/ctcdecode) mit Sprachmodell-Integration.
+    Nutzt numpy für schnellere Verarbeitung.
 
     Args:
         log_probs:   (SeqLen, Batch, NumClasses)
-        beam_width:  Anzahl der Hypothesen im Beam
+        beam_width:  Anzahl der Hypothesen im Beam (höher = besser aber langsamer)
 
     Returns:
         Liste von dekodiertem Text, eine Zeichenkette pro Batch-Element
     """
     seq_len, batch_size, num_classes = log_probs.shape
-    probs = log_probs.exp().cpu()   # → normale Wahrscheinlichkeiten
+    lp = log_probs.detach().cpu().numpy()  # (SeqLen, Batch, NumClasses)
 
     results: List[str] = []
+
     for b in range(batch_size):
-        # Beam: Liste von (score, sequence_as_list, last_char)
-        beams = [(0.0, [], None)]
+        # Beam: dict von (prefix_tuple, last_char_idx) → log_score
+        # last_char_idx = -1 bedeutet: letztes ausgegebenes Zeichen war Blank
+        beams: dict = {((), -1): 0.0}
 
         for t in range(seq_len):
-            new_beams: list = []
-            for score, seq, last_char in beams:
-                for c in range(num_classes):
-                    char = IDX2CHAR.get(c, "")
-                    p = probs[t, b, c].item()
-                    if p < 1e-9:
-                        continue
-                    new_score = score + float(torch.log(torch.tensor(p)))
+            lp_t = lp[t, b]  # (NumClasses,)
 
-                    if char == BLANK_TOKEN:
-                        # Blank: Sequenz unverändert, last_char zurücksetzen
-                        new_beams.append((new_score, seq, None))
-                    elif char == last_char:
-                        # Gleiches Zeichen wie zuvor: nur möglich nach Blank
-                        new_beams.append((new_score, seq, char))
+            # Nur Top-k Klassen berücksichtigen für Effizienz
+            top_k = int(min(beam_width * 3, num_classes))
+            top_indices = np.argpartition(lp_t, -top_k)[-top_k:]
+
+            new_beams: dict = {}
+            for (prefix, last_c), score in beams.items():
+                for c in top_indices:
+                    lp_c = lp_t[c]
+                    new_score = score + lp_c
+
+                    if c == BLANK_IDX:
+                        key = (prefix, -1)
+                    elif c == last_c:
+                        # Gleiche Wiederholung ohne zwischenzeitliches Blank → ignorieren
+                        key = (prefix, c)
                     else:
-                        new_beams.append((new_score, seq + [char], char))
+                        key = (prefix + (int(c),), int(c))
 
-            # Top-k Beams behalten
-            new_beams.sort(key=lambda x: x[0], reverse=True)
-            beams = new_beams[:beam_width]
+                    if key not in new_beams or new_beams[key] < new_score:
+                        new_beams[key] = new_score
 
-        best_seq = beams[0][1] if beams else []
-        results.append("".join(best_seq))
+            # Top beam_width Hypothesen behalten
+            sorted_beams = sorted(new_beams.items(), key=lambda x: x[1], reverse=True)
+            beams = dict(sorted_beams[:beam_width])
+
+        if beams:
+            best_prefix = max(beams.items(), key=lambda x: x[1])[0][0]
+            results.append("".join(IDX2CHAR.get(c, "") for c in best_prefix))
+        else:
+            results.append("")
 
     return results

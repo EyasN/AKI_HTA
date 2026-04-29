@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from src.dataset import ALPHABET, NUM_CLASSES, decode_label
 from src.model import build_model
-from utils.ctc_decoder import greedy_decode
+from utils.ctc_decoder import greedy_decode, beam_search_decode
 from utils.visualization import show_predictions
 
 
@@ -92,6 +92,7 @@ def evaluate_model(
     device: torch.device,
     save_examples: bool = True,
     examples_path: str = "outputs/logs/eval_predictions.png",
+    decoder: str = "greedy",
 ) -> Tuple[float, float]:
     """
     Vollständige Evaluation: CER und WER über einen kompletten Datensatz.
@@ -119,7 +120,10 @@ def evaluate_model(
             images = images.to(device)
             log_probs = model(images)
 
-            preds  = greedy_decode(log_probs)
+            if decoder == "beam":
+                preds = beam_search_decode(log_probs)
+            else:
+                preds = greedy_decode(log_probs)
             truths = decode_batch_labels(labels, label_lengths)
 
             all_preds.extend(preds)
@@ -170,6 +174,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--img-height", type=int, default=32)
     parser.add_argument("--img-width",  type=int, default=128)
+    parser.add_argument("--decoder",    default="greedy", choices=["greedy", "beam"],
+                        help="Decoder-Typ: greedy (schnell) oder beam (besser, langsamer)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -187,4 +193,4 @@ if __name__ == "__main__":
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
 
-    evaluate_model(model, val_loader, device)
+    evaluate_model(model, val_loader, device, decoder=args.decoder)
