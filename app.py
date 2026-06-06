@@ -422,7 +422,7 @@ def main() -> None:
 
         if uploaded:
             image = Image.open(uploaded)
-            st.image(image, caption="Eingabebild", use_column_width=True)
+            st.image(image, caption="Eingabebild", use_container_width=True)
 
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("Handschrift erkennen →", type="primary", use_container_width=True):
@@ -445,7 +445,8 @@ def main() -> None:
         if "result" in st.session_state:
             result = st.session_state["result"]
 
-            st.markdown(f'<div class="result-box">{result if result else "<em style=\'opacity:.5\'>— leer —</em>"}</div>', unsafe_allow_html=True)
+            empty_placeholder = "<em style='opacity:.5'>— leer —</em>"
+            st.markdown(f'<div class="result-box">{result if result else empty_placeholder}</div>', unsafe_allow_html=True)
 
             chars  = len(result)
             words  = len(result.split()) if result.strip() else 0
@@ -490,7 +491,7 @@ def main() -> None:
     curves_path  = Path("outputs/logs/training_curves.png")
 
     if curves_path.exists():
-        st.image(str(curves_path), caption="Loss & CER", use_column_width=True)
+        st.image(str(curves_path), caption="Loss & CER", use_container_width=True)
     elif history_path.exists():
         with open(history_path) as f:
             history = json.load(f)

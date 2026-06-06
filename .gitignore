@@ -1,4 +1,5 @@
 venv/
+.venv/
 __pycache__/
 *.pt
 *.pyc
@@ -8,3 +9,7 @@ outputs/logs/
 *.zip
 .kaggle/
 AKI_HTA/
+requirements.txt
+ANLEITUNG.md
+
+.vscode/settings.json

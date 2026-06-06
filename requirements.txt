@@ -4,10 +4,10 @@
 # ============================================================
 
 # Deep Learning Framework
-# GTX 1050 Ti (SM 6.1) requires PyTorch <=2.2.x with cuDNN 8; install via:
-#   pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cu118
-torch>=2.0.0,<2.3.0
-torchvision>=0.15.0,<0.18.0
+# RTX 3070 (SM 8.6) – install PyTorch with CUDA 12.4 manually BEFORE pip install -r:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+torch>=2.3.0
+torchvision>=0.18.0
 
 # Bildverarbeitung
 Pillow>=9.0.0
