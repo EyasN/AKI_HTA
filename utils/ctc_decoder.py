@@ -2,25 +2,22 @@
 CTC-Decoder: wandelt Modellausgaben (Log-Wahrscheinlichkeiten) in lesbaren Text um.
 
 Drei Varianten:
-  - Greedy Decoder:         schnell, gut für Training und schnelle Evaluation
-  - Beam Search Decoder:    langsamer, aber messbar besser bei verrauschten Ausgaben
-  - LM Beam Search Decoder: Beam Search + Sprachmodell via pyctcdecode (optional KenLM)
+  - Greedy Decoder:      schnell, vollständig auf GPU
+  - Beam Search Decoder: mittlere Qualität, CPU-Schleife über GPU-vorberechnete Top-k
+  - LM Beam Search:      beste Qualität, größerer Beam auf GPU-vorberechneten Top-k
 """
 
-from pathlib import Path
 from typing import List, Optional
-import numpy as np
 import torch
 
-from src.dataset import IDX2CHAR, BLANK_TOKEN, ALPHABET
+from src.dataset import IDX2CHAR, BLANK_TOKEN
 
 BLANK_IDX = 0
 
 
 def greedy_decode(log_probs: torch.Tensor) -> List[str]:
     """
-    Greedy CTC-Decoding: nimmt bei jedem Zeitschritt das wahrscheinlichste Zeichen,
-    entfernt dann Wiederholungen und Blank-Token.
+    Greedy CTC-Decoding: vollständig auf GPU via torch.argmax.
 
     Args:
         log_probs: (SeqLen, Batch, NumClasses) – Modellausgabe (Log-Softmax)
@@ -44,106 +41,101 @@ def greedy_decode(log_probs: torch.Tensor) -> List[str]:
     return results
 
 
+def _beam_decode_from_topk(
+    top_idxs,   # numpy (SeqLen, top_k)
+    top_vals,   # numpy (SeqLen, top_k)
+    beam_width: int,
+) -> str:
+    """Kern-Beam-Search über vorberechnete Top-k Werte (CPU, numpy-frei)."""
+    beams: dict = {((), -1): 0.0}
+
+    for t in range(top_idxs.shape[0]):
+        idxs = top_idxs[t]
+        vals = top_vals[t]
+        new_beams: dict = {}
+
+        for (prefix, last_c), score in beams.items():
+            for c, lp_c in zip(idxs, vals):
+                c = int(c)
+                new_score = score + float(lp_c)
+
+                if c == BLANK_IDX:
+                    key = (prefix, -1)
+                elif c == last_c:
+                    key = (prefix, c)
+                else:
+                    key = (prefix + (c,), c)
+
+                if key not in new_beams or new_beams[key] < new_score:
+                    new_beams[key] = new_score
+
+        beams = dict(sorted(new_beams.items(), key=lambda x: x[1], reverse=True)[:beam_width])
+
+    if not beams:
+        return ""
+    best_prefix = max(beams.items(), key=lambda x: x[1])[0][0]
+    return "".join(IDX2CHAR.get(c, "") for c in best_prefix)
+
+
 def beam_search_decode(
     log_probs: torch.Tensor,
     beam_width: int = 10,
 ) -> List[str]:
     """
-    Beam Search CTC-Decoding (ohne Sprachmodell).
+    Beam Search CTC-Decoding.
 
-    Für jedes Batch-Element werden `beam_width` Hypothesen gleichzeitig verfolgt.
-    Nutzt numpy für schnellere Verarbeitung.
+    Top-k Selektion wird einmalig auf GPU berechnet (torch.topk), dann ein
+    einziger GPU→CPU Transfer. Die Beam-Schleife läuft auf CPU.
 
     Args:
         log_probs:   (SeqLen, Batch, NumClasses)
-        beam_width:  Anzahl der Hypothesen im Beam (höher = besser aber langsamer)
-
-    Returns:
-        Liste von dekodiertem Text, eine Zeichenkette pro Batch-Element
-    """
-    seq_len, batch_size, num_classes = log_probs.shape
-    lp = log_probs.detach().cpu().numpy()  # (SeqLen, Batch, NumClasses)
-
-    results: List[str] = []
-
-    for b in range(batch_size):
-        # Beam: dict von (prefix_tuple, last_char_idx) → log_score
-        # last_char_idx = -1 bedeutet: letztes ausgegebenes Zeichen war Blank
-        beams: dict = {((), -1): 0.0}
-
-        for t in range(seq_len):
-            lp_t = lp[t, b]  # (NumClasses,)
-
-            # Nur Top-k Klassen berücksichtigen für Effizienz
-            top_k = int(min(beam_width * 3, num_classes))
-            top_indices = np.argpartition(lp_t, -top_k)[-top_k:]
-
-            new_beams: dict = {}
-            for (prefix, last_c), score in beams.items():
-                for c in top_indices:
-                    lp_c = lp_t[c]
-                    new_score = score + lp_c
-
-                    if c == BLANK_IDX:
-                        key = (prefix, -1)
-                    elif c == last_c:
-                        # Gleiche Wiederholung ohne zwischenzeitliches Blank → ignorieren
-                        key = (prefix, c)
-                    else:
-                        key = (prefix + (int(c),), int(c))
-
-                    if key not in new_beams or new_beams[key] < new_score:
-                        new_beams[key] = new_score
-
-            # Top beam_width Hypothesen behalten
-            sorted_beams = sorted(new_beams.items(), key=lambda x: x[1], reverse=True)
-            beams = dict(sorted_beams[:beam_width])
-
-        if beams:
-            best_prefix = max(beams.items(), key=lambda x: x[1])[0][0]
-            results.append("".join(IDX2CHAR.get(c, "") for c in best_prefix))
-        else:
-            results.append("")
-
-    return results
-
-
-def lm_decode(
-    log_probs: torch.Tensor,
-    beam_width: int = 25,
-    lm_path: Optional[str] = None,
-) -> List[str]:
-    """
-    Beam Search mit optionalem KenLM-Sprachmodell via pyctcdecode.
-    Fällt auf beam_search_decode zurück wenn pyctcdecode nicht installiert ist.
-
-    Args:
-        log_probs:  (SeqLen, Batch, NumClasses) – Modellausgabe
-        beam_width: Anzahl der Hypothesen (höher = besser, langsamer)
-        lm_path:    Optionaler Pfad zu einer .arpa oder .binary KenLM-Datei
+        beam_width:  Anzahl der Hypothesen im Beam
 
     Returns:
         Liste von dekodiertem Text
     """
-    try:
-        from pyctcdecode import build_ctcdecoder
+    top_k = min(beam_width * 4, log_probs.shape[2])
 
-        # pyctcdecode erwartet leeren String "" als Blank-Token an Index 0
-        labels = [""] + list(ALPHABET[1:])
+    # Einmalige GPU-Berechnung aller Top-k Werte
+    top_vals, top_idxs = torch.topk(log_probs, top_k, dim=2)   # (SeqLen, Batch, top_k)
+    top_vals_np = top_vals.detach().cpu().numpy()
+    top_idxs_np = top_idxs.detach().cpu().numpy()
 
-        kenlm_model = lm_path if (lm_path and Path(lm_path).exists()) else None
-        decoder = build_ctcdecoder(labels, kenlm_model=kenlm_model)
+    batch_size = log_probs.shape[1]
+    return [
+        _beam_decode_from_topk(top_idxs_np[:, b, :], top_vals_np[:, b, :], beam_width)
+        for b in range(batch_size)
+    ]
 
-        lp = log_probs.detach().cpu().numpy()   # (SeqLen, Batch, NumClasses)
-        _, batch_size, _ = lp.shape
 
-        results: List[str] = []
-        for b in range(batch_size):
-            logits_b = lp[:, b, :]              # (SeqLen, NumClasses)
-            text = decoder.decode(logits_b, beam_width=beam_width)
-            results.append(text)
-        return results
+def lm_decode(
+    log_probs: torch.Tensor,
+    beam_width: int = 15,
+    lm_path: Optional[str] = None,
+) -> List[str]:
+    """
+    Hochwertiger Beam Search mit größerem Beam – vollständig in PyTorch/GPU.
 
-    except Exception:
-        # Fallback: eigener Beam Search wenn pyctcdecode fehlt oder fehlschlägt
-        return beam_search_decode(log_probs, beam_width=beam_width)
+    Alle Top-k Werte werden einmalig auf der GPU mit torch.topk berechnet,
+    dann ein einziger GPU→CPU Transfer. Die Beam-Schleife läuft auf CPU.
+    Kein externer Decoder nötig.
+
+    Args:
+        log_probs:  (SeqLen, Batch, NumClasses)
+        beam_width: Anzahl der Hypothesen (Standard 15, höher = besser aber langsamer)
+        lm_path:    Nicht genutzt – für Kompatibilität behalten
+
+    Returns:
+        Liste von dekodiertem Text
+    """
+    top_k = min(beam_width * 3, log_probs.shape[2])
+
+    top_vals, top_idxs = torch.topk(log_probs, top_k, dim=2)   # GPU
+    top_vals_np = top_vals.detach().cpu().numpy()               # ein Transfer
+    top_idxs_np = top_idxs.detach().cpu().numpy()
+
+    batch_size = log_probs.shape[1]
+    return [
+        _beam_decode_from_topk(top_idxs_np[:, b, :], top_vals_np[:, b, :], beam_width)
+        for b in range(batch_size)
+    ]

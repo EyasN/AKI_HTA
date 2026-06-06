@@ -316,18 +316,41 @@ def load_model(checkpoint_path: str, img_height: int, img_width: int):
     return model, transform, device, info
 
 
-def predict_image(image: Image.Image, model, transform, device, decoder: str = "greedy") -> str:
+def predict_image(image: Image.Image, model, transform, device, decoder: str = "greedy"):
     img_gray = image.convert("L")
-    tensor   = transform(img_gray).unsqueeze(0).to(device)
 
+    # Preprocessing-Preview: was das Modell wirklich sieht
+    preprocessed_pil = img_gray.resize((128, 32), Image.LANCZOS)
+
+    tensor = transform(img_gray).unsqueeze(0).to(device)
     with torch.no_grad():
         log_probs = model(tensor)
 
+    # Konfidenz: mittlere Max-Wahrscheinlichkeit pro Zeitschritt
+    confidence = float(torch.exp(log_probs).max(dim=2).values.mean()) * 100
+
+    # Hauptergebnis mit gewähltem Decoder
     if decoder == "Beam Search":
-        return beam_search_decode(log_probs, beam_width=10)[0]
-    if decoder == "LM Beam Search":
-        return lm_decode(log_probs, beam_width=25)[0]
-    return greedy_decode(log_probs)[0]
+        text = beam_search_decode(log_probs, beam_width=10)[0]
+    elif decoder == "LM Beam Search":
+        text = lm_decode(log_probs, beam_width=25)[0]
+    else:
+        text = greedy_decode(log_probs)[0]
+
+    # Top-Kandidaten aus allen drei Decodern (Duplikate entfernt)
+    all_results = [
+        ("Greedy",         greedy_decode(log_probs)[0]),
+        ("Beam Search",    beam_search_decode(log_probs, beam_width=10)[0]),
+        ("LM Beam Search", lm_decode(log_probs, beam_width=25)[0]),
+    ]
+    seen: set = set()
+    candidates = []
+    for label, result in all_results:
+        if result not in seen:
+            seen.add(result)
+            candidates.append((label, result))
+
+    return text, confidence, preprocessed_pil, candidates
 
 
 # ── Hauptlayout ───────────────────────────────────────────────────────────────
@@ -427,10 +450,20 @@ def main() -> None:
             st.image(image, caption="Eingabebild", use_container_width=True)
 
             st.markdown("<br>", unsafe_allow_html=True)
+            if "prediction" in st.session_state:
+                st.markdown('<div class="section-label" style="margin-top:1rem; font-size:0.7rem;">Was das Modell sieht (32×128 px)</div>', unsafe_allow_html=True)
+                st.image(st.session_state["prediction"]["preprocessed"], use_container_width=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
             if st.button("Handschrift erkennen →", type="primary", use_container_width=True):
                 with st.spinner("Analysiere Handschrift …"):
-                    text = predict_image(image, model, transform, device, decoder)
-                st.session_state["result"] = text
+                    text, confidence, preprocessed_pil, candidates = predict_image(image, model, transform, device, decoder)
+                st.session_state["prediction"] = {
+                    "text": text,
+                    "confidence": confidence,
+                    "preprocessed": preprocessed_pil,
+                    "candidates": candidates,
+                }
                 st.rerun()
         else:
             st.markdown("""
@@ -444,21 +477,32 @@ def main() -> None:
     with col2:
         st.markdown('<div class="section-label">Erkannter Text</div>', unsafe_allow_html=True)
 
-        if "result" in st.session_state:
-            result = st.session_state["result"]
+        if "prediction" in st.session_state:
+            pred   = st.session_state["prediction"]
+            result = pred["text"]
+            conf   = pred["confidence"]
+            candidates = pred["candidates"]
 
             empty_placeholder = "<em style='opacity:.5'>— leer —</em>"
             st.markdown(f'<div class="result-box">{result if result else empty_placeholder}</div>', unsafe_allow_html=True)
 
-            chars  = len(result)
-            words  = len(result.split()) if result.strip() else 0
+            chars = len(result)
+            words = len(result.split()) if result.strip() else 0
             st.markdown(f"""
             <div class="stat-row">
               <div class="stat-chip">{chars} Zeichen</div>
               <div class="stat-chip">{words} Wörter</div>
+              <div class="stat-chip">Konfidenz: {conf:.0f}%</div>
               <div class="stat-chip">Decoder: {decoder}</div>
             </div>
             """, unsafe_allow_html=True)
+
+            if len(candidates) > 1:
+                st.markdown("<br>", unsafe_allow_html=True)
+                with st.expander("Alternative Kandidaten"):
+                    for label, cand in candidates:
+                        marker = "✓" if cand == result else "○"
+                        st.markdown(f"**{marker} {label}:** `{cand}`")
 
             st.markdown("<br>", unsafe_allow_html=True)
             st.download_button(
@@ -479,11 +523,12 @@ def main() -> None:
     # ── Metriken-Leiste ──
     if info["loaded"] and info["val_cer"] is not None:
         st.markdown('<hr class="fancy-divider">', unsafe_allow_html=True)
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Val CER", f"{info['val_cer']:.4f}")
-        m2.metric("Trainierte Epochen", info["epoch"])
-        m3.metric("Parameter", f"{n_params/1e6:.1f} M")
-        m4.metric("Decoder", decoder)
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Char Accuracy", f"{(1 - info['val_cer']) * 100:.1f}%")
+        m2.metric("Val CER", f"{info['val_cer'] * 100:.2f}%")
+        m3.metric("Epochen", info["epoch"])
+        m4.metric("Parameter", f"{n_params/1e6:.1f} M")
+        m5.metric("Decoder", decoder)
 
     # ── Trainingsverlauf ──
     st.markdown('<hr class="fancy-divider">', unsafe_allow_html=True)

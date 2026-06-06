@@ -123,7 +123,7 @@ def evaluate_model(
             if decoder == "beam":
                 preds = beam_search_decode(log_probs)
             elif decoder == "lm":
-                preds = lm_decode(log_probs, beam_width=25)
+                preds = lm_decode(log_probs)
             else:
                 preds = greedy_decode(log_probs)
             truths = decode_batch_labels(labels, label_lengths)
@@ -140,11 +140,16 @@ def evaluate_model(
     cer = compute_cer(all_preds, all_labels)
     wer = compute_wer(all_preds, all_labels)
 
+    char_acc = (1 - cer) * 100
+    word_acc = (1 - wer) * 100
+
     print(f"\n{'='*45}")
     print(f"  Evaluation Ergebnis")
     print(f"{'='*45}")
-    print(f"  Character Error Rate (CER): {cer:.4f}  ({cer*100:.2f}%)")
-    print(f"  Word Error Rate     (WER): {wer:.4f}  ({wer*100:.2f}%)")
+    print(f"  Character Accuracy:         {char_acc:.2f}%")
+    print(f"  Word Accuracy:              {word_acc:.2f}%")
+    print(f"  Character Error Rate (CER): {cer*100:.2f}%")
+    print(f"  Word Error Rate     (WER):  {wer*100:.2f}%")
     print(f"  Samples evaluiert:          {len(all_preds)}")
     print(f"{'='*45}\n")
 

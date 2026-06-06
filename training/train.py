@@ -25,6 +25,7 @@ from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
@@ -79,6 +80,10 @@ class Trainer:
             self.optimizer, mode="min", factor=0.5, patience=patience // 2
         )
 
+        # Mixed Precision: GradScaler für float16 auf CUDA (Tensor Cores)
+        self.use_amp = device.type == "cuda"
+        self.scaler  = GradScaler("cuda" if self.use_amp else "cpu", enabled=self.use_amp)
+
         self.writer = SummaryWriter(log_dir=log_dir)
 
         # Verlaufs-Tracking
@@ -122,8 +127,8 @@ class Trainer:
 
             print(
                 f"Epoch {epoch:03d}/{epochs:03d} | "
-                f"Train Loss: {train_loss:.4f}  CER: {train_cer:.4f} | "
-                f"Val Loss: {val_loss:.4f}  CER: {val_cer:.4f} | "
+                f"Train Loss: {train_loss:.4f}  Acc: {(1-train_cer)*100:.1f}% | "
+                f"Val Loss: {val_loss:.4f}  Acc: {(1-val_cer)*100:.1f}% | "
                 f"LR: {self.optimizer.param_groups[0]['lr']:.2e} | "
                 f"{elapsed:.1f}s"
             )
@@ -169,23 +174,23 @@ class Trainer:
             labels        = labels.to(self.device)
             label_lengths = label_lengths.to(self.device)
 
-            # Vorwärtsdurchlauf
-            log_probs = self.model(images)  # (SeqLen, Batch, NumClasses)
-
-            # CTC-Loss benötigt: log_probs, labels, input_lengths, target_lengths
-            # input_lengths = Sequenzlänge der CNN-Ausgabe (gleich für alle im Batch)
-            seq_len     = log_probs.size(0)
-            batch_size  = images.size(0)
-            input_lengths = torch.full((batch_size,), seq_len, dtype=torch.long, device=self.device)
-
-            loss = self.criterion(log_probs, labels, input_lengths, label_lengths)
-
-            # Rückwärtsdurchlauf
+            # Vorwärtsdurchlauf mit Mixed Precision (float16 auf Tensor Cores)
             self.optimizer.zero_grad()
-            loss.backward()
-            # Gradient Clipping verhindert explodierende Gradienten in RNNs
+            with autocast(enabled=self.use_amp):
+                log_probs = self.model(images)  # (SeqLen, Batch, NumClasses)
+
+                seq_len       = log_probs.size(0)
+                batch_size    = images.size(0)
+                input_lengths = torch.full((batch_size,), seq_len, dtype=torch.long, device=self.device)
+
+                loss = self.criterion(log_probs, labels, input_lengths, label_lengths)
+
+            # Rückwärtsdurchlauf mit GradScaler (verhindert Underflow bei float16)
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
             total_loss += loss.item()
 
@@ -278,6 +283,7 @@ def main() -> None:
     print(f"Gerät: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
+        torch.backends.cudnn.benchmark = True  # schnellsten Algorithmus für feste Eingabegröße finden
 
     # Daten laden
     train_loader, val_loader = get_dataloaders(
