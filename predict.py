@@ -50,12 +50,19 @@ class HTRPredictor:
         self.decoder   = decoder
         self.transform = get_val_transforms(img_height, img_width)
 
-        if arch == "seq2seq":
-            self.model = build_seq2seq_model(img_height=img_height, vocab_size=SEQ2SEQ_VOCAB)
-        else:
-            self.model = build_model(img_height=img_height, num_classes=NUM_CLASSES)
+        checkpoint  = torch.load(checkpoint_path, map_location=self.device)
+        sd          = checkpoint["model_state_dict"]
+        lstm_hidden = (sd["rnn.weight_hh_l0"].shape[0] // 4
+                       if "rnn.weight_hh_l0" in sd
+                       else checkpoint.get("lstm_hidden", 256))
 
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        if arch == "seq2seq":
+            self.model = build_seq2seq_model(img_height=img_height, vocab_size=SEQ2SEQ_VOCAB,
+                                             lstm_hidden=lstm_hidden)
+        else:
+            self.model = build_model(img_height=img_height, num_classes=NUM_CLASSES,
+                                     lstm_hidden=lstm_hidden)
+
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.to(self.device)
         self.model.eval()

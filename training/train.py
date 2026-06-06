@@ -440,6 +440,7 @@ class Seq2SeqTrainer:
             "val_cer":              val_cer,
             "history":              self.history,
             "arch":                 "seq2seq",
+            "lstm_hidden":          self.model.rnn.hidden_size,
         }, Path(self.checkpoint_dir) / filename)
 
     def _save_history(self) -> None:

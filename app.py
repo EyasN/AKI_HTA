@@ -300,20 +300,35 @@ st.markdown("""
 def load_model(checkpoint_path: str, arch: str, img_height: int, img_width: int):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if arch == "seq2seq":
-        model = build_seq2seq_model(img_height=img_height, vocab_size=SEQ2SEQ_VOCAB)
-    else:
-        model = build_model(img_height=img_height, num_classes=NUM_CLASSES)
-
     try:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint  = torch.load(checkpoint_path, map_location=device)
+        # Automatisch aus Gewichts-Shape ableiten (funktioniert auch für alte Checkpoints)
+        sd = checkpoint["model_state_dict"]
+        lstm_hidden = (sd["rnn.weight_hh_l0"].shape[0] // 4
+                       if "rnn.weight_hh_l0" in sd
+                       else checkpoint.get("lstm_hidden", 256))
+
+        if arch == "seq2seq":
+            model = build_seq2seq_model(img_height=img_height, vocab_size=SEQ2SEQ_VOCAB,
+                                        lstm_hidden=lstm_hidden)
+        else:
+            model = build_model(img_height=img_height, num_classes=NUM_CLASSES,
+                                lstm_hidden=lstm_hidden)
+
         model.load_state_dict(checkpoint["model_state_dict"])
         epoch   = checkpoint.get("epoch", "?")
         val_cer = checkpoint.get("val_cer", None)
-        info    = {"epoch": epoch, "val_cer": val_cer, "loaded": True, "arch": arch}
+        info    = {"epoch": epoch, "val_cer": val_cer, "loaded": True,
+                   "arch": arch, "lstm_hidden": lstm_hidden}
     except (FileNotFoundError, RuntimeError) as e:
         st.warning(f"Checkpoint nicht gefunden: {e}\nModell hat zufällige Gewichte.")
-        info = {"epoch": 0, "val_cer": None, "loaded": False, "arch": arch}
+        lstm_hidden = 256
+        if arch == "seq2seq":
+            model = build_seq2seq_model(img_height=img_height, vocab_size=SEQ2SEQ_VOCAB)
+        else:
+            model = build_model(img_height=img_height, num_classes=NUM_CLASSES)
+        info = {"epoch": 0, "val_cer": None, "loaded": False,
+                "arch": arch, "lstm_hidden": lstm_hidden}
 
     model.to(device)
     model.eval()
@@ -426,6 +441,10 @@ def main() -> None:
           <div class="info-row">
             <span class="info-label">Architektur</span>
             <span class="info-value">{arch}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">LSTM Hidden</span>
+            <span class="info-value">{info.get("lstm_hidden", 256)}</span>
           </div>
           <div class="info-row">
             <span class="info-label">Klassen</span>
