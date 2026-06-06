@@ -27,6 +27,7 @@ Warum CTC-Loss?
   ideal für variable Textlängen ohne Segmentierungsannotationen.
 """
 
+import math
 import torch
 import torch.nn as nn
 from typing import Tuple
@@ -136,8 +137,131 @@ class CRNN(nn.Module):
 
 def build_model(img_height: int, num_classes: int, lstm_hidden: int = 256) -> CRNN:
     """Factory-Funktion: erstellt und gibt ein CRNN-Modell zurück."""
-    model = CRNN(img_height=img_height, num_classes=num_classes, lstm_hidden=lstm_hidden)
-    return model
+    return CRNN(img_height=img_height, num_classes=num_classes, lstm_hidden=lstm_hidden)
+
+
+# ── Seq2Seq: CNN + BiLSTM + Transformer Decoder ───────────────────────────────
+
+class PositionalEncoding(nn.Module):
+    """Sinusoidales Positional Encoding für Transformer."""
+
+    def __init__(self, d_model: int, max_len: int = 512, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe.unsqueeze(1))   # (max_len, 1, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout(x + self.pe[:x.size(0)])
+
+
+class CRNN_Seq2Seq(nn.Module):
+    """
+    CNN + BiLSTM Encoder mit Transformer Decoder.
+
+    Architektur:
+      Bild → CNN → BiLSTM → Transformer Decoder → Text
+
+    Vorteil gegenüber CTC: Der Decoder generiert Zeichen autoregressiv und
+    berücksichtigt dabei alle bisherigen Ausgaben (Sprachwissen durch Self-Attention).
+    Training mit Teacher Forcing, Inferenz autoregressiv.
+    """
+
+    def __init__(
+        self,
+        img_height: int,
+        vocab_size: int,
+        lstm_hidden: int = 256,
+        d_model: int = 256,
+        nhead: int = 8,
+        num_decoder_layers: int = 3,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        # ── CNN (identisch zu CRNN) ───────────────────────────────────────────
+        self.cnn = nn.Sequential(
+            ConvBlock(1,   64,  pool=True,  pool_kernel=(2, 2)),
+            ConvBlock(64,  128, pool=True,  pool_kernel=(2, 2)),
+            ConvBlock(128, 256, pool=False),
+            ConvBlock(256, 256, pool=True,  pool_kernel=(2, 1)),
+            ConvBlock(256, 512, pool=False),
+            ConvBlock(512, 512, pool=True,  pool_kernel=(2, 1)),
+            ConvBlock(512, 512, pool=False),
+        )
+        cnn_out_h   = img_height // 16
+        rnn_in_size = 512 * cnn_out_h
+
+        # ── BiLSTM Encoder ────────────────────────────────────────────────────
+        self.rnn = nn.LSTM(rnn_in_size, lstm_hidden, num_layers=2,
+                           bidirectional=True, batch_first=False, dropout=0.3)
+
+        # ── Projektion Encoder → d_model ──────────────────────────────────────
+        self.enc_proj = nn.Linear(lstm_hidden * 2, d_model)
+        self.enc_pos  = PositionalEncoding(d_model, dropout=dropout)
+
+        # ── Decoder Embeddings ────────────────────────────────────────────────
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.dec_pos   = PositionalEncoding(d_model, dropout=dropout)
+        self._scale    = math.sqrt(d_model)
+
+        # ── Transformer Decoder ───────────────────────────────────────────────
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=d_model * 4,
+            dropout=dropout, batch_first=False,
+        )
+        self.transformer_decoder = nn.TransformerDecoder(dec_layer, num_layers=num_decoder_layers)
+
+        # ── Ausgabe-Projektion ────────────────────────────────────────────────
+        self.fc = nn.Linear(d_model, vocab_size)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """CNN + BiLSTM → (seq_len, batch, d_model)"""
+        feat = self.cnn(x)
+        B, C, H, W = feat.size()
+        feat = feat.permute(3, 0, 1, 2).contiguous().view(W, B, C * H)
+        rnn_out, _ = self.rnn(feat)
+        return self.enc_pos(self.enc_proj(rnn_out))
+
+    def decode(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: torch.Tensor | None = None,
+        tgt_key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Transformer Decoder Schritt. tgt: (tgt_len, batch)"""
+        emb = self.dec_pos(self.embedding(tgt) * self._scale)
+        out = self.transformer_decoder(
+            emb, memory,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+        )
+        return self.fc(out)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        tgt: torch.Tensor,
+        tgt_mask: torch.Tensor | None = None,
+        tgt_key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.decode(tgt, self.encode(x), tgt_mask, tgt_key_padding_mask)
+
+
+def build_seq2seq_model(
+    img_height: int,
+    vocab_size: int,
+    lstm_hidden: int = 256,
+    d_model: int = 256,
+) -> CRNN_Seq2Seq:
+    """Factory-Funktion für das Seq2Seq-Modell."""
+    return CRNN_Seq2Seq(img_height, vocab_size, lstm_hidden, d_model)
 
 
 if __name__ == "__main__":

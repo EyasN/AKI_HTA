@@ -12,10 +12,11 @@ import streamlit as st
 import torch
 from PIL import Image
 
-from src.dataset import NUM_CLASSES, ALPHABET
-from src.model import build_model
+from src.dataset import NUM_CLASSES, SEQ2SEQ_VOCAB, ALPHABET
+from src.model import build_model, build_seq2seq_model
 from src.transforms import get_val_transforms
 from utils.ctc_decoder import greedy_decode, beam_search_decode, lm_decode
+from utils.seq2seq_decoder import seq2seq_greedy_decode
 
 
 # ── Seitenkonfiguration ───────────────────────────────────────────────────────
@@ -296,19 +297,23 @@ st.markdown("""
 # ── Modell-Caching ────────────────────────────────────────────────────────────
 
 @st.cache_resource
-def load_model(checkpoint_path: str, img_height: int, img_width: int):
+def load_model(checkpoint_path: str, arch: str, img_height: int, img_width: int):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = build_model(img_height=img_height, num_classes=NUM_CLASSES)
+
+    if arch == "seq2seq":
+        model = build_seq2seq_model(img_height=img_height, vocab_size=SEQ2SEQ_VOCAB)
+    else:
+        model = build_model(img_height=img_height, num_classes=NUM_CLASSES)
 
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
         epoch   = checkpoint.get("epoch", "?")
         val_cer = checkpoint.get("val_cer", None)
-        info    = {"epoch": epoch, "val_cer": val_cer, "loaded": True}
+        info    = {"epoch": epoch, "val_cer": val_cer, "loaded": True, "arch": arch}
     except (FileNotFoundError, RuntimeError) as e:
         st.warning(f"Checkpoint nicht gefunden: {e}\nModell hat zufällige Gewichte.")
-        info = {"epoch": 0, "val_cer": None, "loaded": False}
+        info = {"epoch": 0, "val_cer": None, "loaded": False, "arch": arch}
 
     model.to(device)
     model.eval()
@@ -316,20 +321,22 @@ def load_model(checkpoint_path: str, img_height: int, img_width: int):
     return model, transform, device, info
 
 
-def predict_image(image: Image.Image, model, transform, device, decoder: str = "greedy"):
+def predict_image(image: Image.Image, model, transform, device, arch: str = "crnn", decoder: str = "greedy"):
     img_gray = image.convert("L")
-
-    # Preprocessing-Preview: was das Modell wirklich sieht
     preprocessed_pil = img_gray.resize((128, 32), Image.LANCZOS)
-
     tensor = transform(img_gray).unsqueeze(0).to(device)
+
+    if arch == "seq2seq":
+        text       = seq2seq_greedy_decode(model, tensor)[0]
+        confidence = 100.0
+        candidates = [("Seq2Seq Greedy", text)]
+        return text, confidence, preprocessed_pil, candidates
+
     with torch.no_grad():
         log_probs = model(tensor)
 
-    # Konfidenz: mittlere Max-Wahrscheinlichkeit pro Zeitschritt
     confidence = float(torch.exp(log_probs).max(dim=2).values.mean()) * 100
 
-    # Hauptergebnis mit gewähltem Decoder
     if decoder == "Beam Search":
         text = beam_search_decode(log_probs, beam_width=10)[0]
     elif decoder == "LM Beam Search":
@@ -337,7 +344,6 @@ def predict_image(image: Image.Image, model, transform, device, decoder: str = "
     else:
         text = greedy_decode(log_probs)[0]
 
-    # Top-Kandidaten aus allen drei Decodern (Duplikate entfernt)
     all_results = [
         ("Greedy",         greedy_decode(log_probs)[0]),
         ("Beam Search",    beam_search_decode(log_probs, beam_width=10)[0]),
@@ -369,28 +375,41 @@ def main() -> None:
 
         st.markdown('<div class="section-label">Modell-Konfiguration</div>', unsafe_allow_html=True)
 
-        checkpoint_path = st.text_input(
-            "Checkpoint-Pfad",
-            value="outputs/checkpoints/best_model.pt",
-            help="Pfad zur gespeicherten Modelldatei (.pt)",
+        arch = st.radio(
+            "Architektur",
+            ["CRNN (CTC)", "Seq2Seq (Transformer)"],
+            index=0,
+            label_visibility="visible",
         )
+        arch_key = "seq2seq" if arch == "Seq2Seq (Transformer)" else "crnn"
+
+        default_ckpt = (
+            "outputs/checkpoints/best_seq2seq.pt"
+            if arch_key == "seq2seq"
+            else "outputs/checkpoints/best_model.pt"
+        )
+        checkpoint_path = st.text_input("Checkpoint-Pfad", value=default_ckpt)
         img_height = st.number_input("Bild-Höhe (px)", min_value=16, max_value=64, value=32)
         img_width  = st.number_input("Bild-Breite (px)", min_value=64, max_value=512, value=128)
 
         st.markdown('<hr class="fancy-divider">', unsafe_allow_html=True)
         st.markdown('<div class="section-label">Decoder</div>', unsafe_allow_html=True)
 
-        decoder = st.radio(
-            "Decoder-Methode",
-            ["Greedy", "Beam Search", "LM Beam Search"],
-            index=2,
-            label_visibility="collapsed",
-        )
+        if arch_key == "seq2seq":
+            decoder = "Seq2Seq Greedy"
+            st.markdown('<span style="color:#7c6faa;font-size:0.85rem;">Seq2Seq nutzt autoregressives Greedy Decoding</span>', unsafe_allow_html=True)
+        else:
+            decoder = st.radio(
+                "Decoder-Methode",
+                ["Greedy", "Beam Search", "LM Beam Search"],
+                index=2,
+                label_visibility="collapsed",
+            )
 
         st.markdown('<hr class="fancy-divider">', unsafe_allow_html=True)
         st.markdown('<div class="section-label">Modell-Status</div>', unsafe_allow_html=True)
 
-        model, transform, device, info = load_model(checkpoint_path, img_height, img_width)
+        model, transform, device, info = load_model(checkpoint_path, arch_key, img_height, img_width)
         n_params = sum(p.numel() for p in model.parameters())
 
         if info["loaded"]:
@@ -405,8 +424,12 @@ def main() -> None:
             <span class="info-value">{device}</span>
           </div>
           <div class="info-row">
+            <span class="info-label">Architektur</span>
+            <span class="info-value">{arch}</span>
+          </div>
+          <div class="info-row">
             <span class="info-label">Klassen</span>
-            <span class="info-value">{NUM_CLASSES}</span>
+            <span class="info-value">{NUM_CLASSES if arch_key == "crnn" else SEQ2SEQ_VOCAB}</span>
           </div>
           <div class="info-row">
             <span class="info-label">Parameter</span>
@@ -430,7 +453,7 @@ def main() -> None:
     st.markdown("""
     <div class="hero-banner">
       <h1 class="hero-title">Handwritten Text Recognition</h1>
-      <p class="hero-subtitle">CRNN · CNN + BiLSTM + CTC-Loss · Deep Learning</p>
+      <p class="hero-subtitle">CNN + BiLSTM + CTC · CNN + BiLSTM + Transformer · Deep Learning</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -457,7 +480,7 @@ def main() -> None:
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("Handschrift erkennen →", type="primary", use_container_width=True):
                 with st.spinner("Analysiere Handschrift …"):
-                    text, confidence, preprocessed_pil, candidates = predict_image(image, model, transform, device, decoder)
+                    text, confidence, preprocessed_pil, candidates = predict_image(image, model, transform, device, arch_key, decoder)
                 st.session_state["prediction"] = {
                     "text": text,
                     "confidence": confidence,
@@ -534,8 +557,12 @@ def main() -> None:
     st.markdown('<hr class="fancy-divider">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">Trainingsverlauf</div>', unsafe_allow_html=True)
 
-    history_path = Path("outputs/logs/history.json")
-    curves_path  = Path("outputs/logs/training_curves.png")
+    if arch_key == "seq2seq":
+        history_path = Path("outputs/logs/history_seq2seq.json")
+        curves_path  = Path("outputs/logs/training_curves_seq2seq.png")
+    else:
+        history_path = Path("outputs/logs/history.json")
+        curves_path  = Path("outputs/logs/training_curves.png")
 
     if curves_path.exists():
         st.image(str(curves_path), caption="Loss & CER", use_container_width=True)

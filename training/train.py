@@ -25,16 +25,17 @@ from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from src.dataset import NUM_CLASSES, get_dataloaders
-from src.model import build_model
+from src.dataset import NUM_CLASSES, SEQ2SEQ_VOCAB, PAD_IDX, get_dataloaders, get_seq2seq_dataloaders
+from src.model import build_model, build_seq2seq_model
 from evaluation.evaluate import compute_cer, decode_batch_labels
 from utils.ctc_decoder import greedy_decode
+from utils.seq2seq_decoder import seq2seq_greedy_decode, decode_seq2seq_labels
 from utils.visualization import plot_training_curves
 
 
@@ -82,7 +83,7 @@ class Trainer:
 
         # Mixed Precision: GradScaler für float16 auf CUDA (Tensor Cores)
         self.use_amp = device.type == "cuda"
-        self.scaler  = GradScaler("cuda" if self.use_amp else "cpu", enabled=self.use_amp)
+        self.scaler  = GradScaler("cuda" if self.use_amp else "cpu")
 
         self.writer = SummaryWriter(log_dir=log_dir)
 
@@ -127,8 +128,8 @@ class Trainer:
 
             print(
                 f"Epoch {epoch:03d}/{epochs:03d} | "
-                f"Train Loss: {train_loss:.4f}  Acc: {(1-train_cer)*100:.1f}% | "
-                f"Val Loss: {val_loss:.4f}  Acc: {(1-val_cer)*100:.1f}% | "
+                f"Train Loss: {train_loss:.4f}  Acc: {max(0, 1-train_cer)*100:.1f}%  CER: {train_cer:.4f} | "
+                f"Val Loss: {val_loss:.4f}  Acc: {max(0, 1-val_cer)*100:.1f}%  CER: {val_cer:.4f} | "
                 f"LR: {self.optimizer.param_groups[0]['lr']:.2e} | "
                 f"{elapsed:.1f}s"
             )
@@ -176,7 +177,7 @@ class Trainer:
 
             # Vorwärtsdurchlauf mit Mixed Precision (float16 auf Tensor Cores)
             self.optimizer.zero_grad()
-            with autocast(enabled=self.use_amp):
+            with autocast("cuda" if self.use_amp else "cpu", enabled=self.use_amp):
                 log_probs = self.model(images)  # (SeqLen, Batch, NumClasses)
 
                 seq_len       = log_probs.size(0)
@@ -257,22 +258,214 @@ class Trainer:
         print(f"Verlauf gespeichert: {path}")
 
 
+# ── Seq2Seq Trainer ───────────────────────────────────────────────────────────
+
+class Seq2SeqTrainer:
+    """
+    Trainingslogik für CNN + BiLSTM + Transformer Decoder.
+    Nutzt Teacher Forcing und CrossEntropyLoss statt CTCLoss.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        train_loader: torch.utils.data.DataLoader,
+        val_loader:   torch.utils.data.DataLoader,
+        lr: float = 1e-3,
+        weight_decay: float = 1e-4,
+        patience: int = 15,
+        checkpoint_dir: str = "outputs/checkpoints",
+        log_dir: str = "outputs/logs",
+        device: torch.device = torch.device("cpu"),
+    ) -> None:
+        self.model        = model.to(device)
+        self.device       = device
+        self.train_loader = train_loader
+        self.val_loader   = val_loader
+        self.patience     = patience
+        self.checkpoint_dir = checkpoint_dir
+        self.log_dir        = log_dir
+
+        Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+
+        self.criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
+        self.optimizer = Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        self.scheduler = ReduceLROnPlateau(self.optimizer, mode="min", factor=0.5, patience=patience // 2)
+        self.writer    = SummaryWriter(log_dir=log_dir)
+
+        self.use_amp = device.type == "cuda"
+        self.scaler  = GradScaler("cuda" if self.use_amp else "cpu")
+
+        self.history: Dict[str, List[float]] = {
+            "train_loss": [], "val_loss": [], "train_cer": [], "val_cer": [],
+        }
+        self.best_val_cer      = float("inf")
+        self.epochs_no_improve = 0
+
+    def fit(self, epochs: int) -> Dict[str, List[float]]:
+        print(f"\nSeq2Seq Training auf: {self.device}")
+        print(f"Epochen: {epochs}  |  Patience: {self.patience}\n")
+
+        for epoch in range(1, epochs + 1):
+            t0 = time.time()
+            train_loss, train_cer = self._train_epoch(epoch)
+            val_loss,   val_cer   = self._val_epoch()
+            elapsed = time.time() - t0
+
+            self.history["train_loss"].append(train_loss)
+            self.history["val_loss"].append(val_loss)
+            self.history["train_cer"].append(train_cer)
+            self.history["val_cer"].append(val_cer)
+
+            self.writer.add_scalars("Loss", {"train": train_loss, "val": val_loss}, epoch)
+            self.writer.add_scalars("CER",  {"train": train_cer,  "val": val_cer},  epoch)
+            self.writer.add_scalar("LearningRate", self.optimizer.param_groups[0]["lr"], epoch)
+
+            print(
+                f"Epoch {epoch:03d}/{epochs:03d} | "
+                f"Train Loss: {train_loss:.4f}  Acc: {max(0, 1-train_cer)*100:.1f}%  CER: {train_cer:.4f} | "
+                f"Val Loss: {val_loss:.4f}  Acc: {max(0, 1-val_cer)*100:.1f}%  CER: {val_cer:.4f} | "
+                f"LR: {self.optimizer.param_groups[0]['lr']:.2e} | "
+                f"{elapsed:.1f}s"
+            )
+
+            self.scheduler.step(val_loss)
+
+            if val_cer < self.best_val_cer:
+                self.best_val_cer = val_cer
+                self.epochs_no_improve = 0
+                self._save_checkpoint(epoch, val_cer, is_best=True)
+                print(f"  → Bestes Seq2Seq-Modell gespeichert (CER: {val_cer:.4f})")
+            else:
+                self.epochs_no_improve += 1
+
+            if epoch % 10 == 0:
+                self._save_checkpoint(epoch, val_cer, is_best=False)
+
+            if self.epochs_no_improve >= self.patience:
+                print(f"\nEarly Stopping nach {epoch} Epochen.")
+                break
+
+        self.writer.close()
+        self._save_history()
+        plot_training_curves(self.history, save_path=f"{self.log_dir}/training_curves_seq2seq.png")
+        return self.history
+
+    def _train_epoch(self, epoch: int) -> Tuple[float, float]:
+        self.model.train()
+        total_loss = 0.0
+        last_images = None
+        last_tgt    = None
+
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} Train", leave=False)
+        for images, tgt in pbar:
+            images = images.to(self.device)
+            tgt    = tgt.to(self.device).T          # (max_len, batch)
+
+            tgt_input  = tgt[:-1]
+            tgt_output = tgt[1:]
+            tgt_len    = tgt_input.size(0)
+            tgt_mask   = torch.triu(torch.ones(tgt_len, tgt_len, dtype=torch.bool, device=self.device), diagonal=1)
+            pad_mask   = (tgt_input.T == PAD_IDX)
+
+            self.optimizer.zero_grad()
+            with autocast("cuda" if self.use_amp else "cpu", enabled=self.use_amp):
+                logits = self.model(images, tgt_input, tgt_mask=tgt_mask,
+                                    tgt_key_padding_mask=pad_mask)
+                loss = self.criterion(
+                    logits.reshape(-1, logits.size(-1)),
+                    tgt_output.reshape(-1),
+                )
+
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            total_loss += loss.item()
+            last_images = images
+            last_tgt    = tgt
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        # CER-Schätzung auf letztem Batch (einmalig statt pro Batch — deutlich schneller)
+        train_cer = 0.0
+        if last_images is not None:
+            with torch.no_grad():
+                with autocast("cuda" if self.use_amp else "cpu", enabled=self.use_amp):
+                    preds  = seq2seq_greedy_decode(self.model, last_images)
+                truths = decode_seq2seq_labels(last_tgt.T)
+                train_cer = compute_cer(preds, truths)
+
+        return total_loss / len(self.train_loader), train_cer
+
+    def _val_epoch(self) -> Tuple[float, float]:
+        self.model.eval()
+        total_loss = 0.0
+        all_preds:  List[str] = []
+        all_labels: List[str] = []
+
+        with torch.no_grad():
+            for images, tgt in tqdm(self.val_loader, desc="  Val", leave=False):
+                images = images.to(self.device)
+                tgt    = tgt.to(self.device).T
+
+                tgt_input  = tgt[:-1]
+                tgt_output = tgt[1:]
+                tgt_len    = tgt_input.size(0)
+                tgt_mask   = torch.triu(torch.ones(tgt_len, tgt_len, dtype=torch.bool, device=self.device), diagonal=1)
+                pad_mask   = (tgt_input.T == PAD_IDX)
+
+                with autocast("cuda" if self.use_amp else "cpu", enabled=self.use_amp):
+                    logits = self.model(images, tgt_input, tgt_mask=tgt_mask,
+                                        tgt_key_padding_mask=pad_mask)
+                    loss = self.criterion(logits.reshape(-1, logits.size(-1)), tgt_output.reshape(-1))
+
+                total_loss += loss.item()
+                with autocast("cuda" if self.use_amp else "cpu", enabled=self.use_amp):
+                    preds = seq2seq_greedy_decode(self.model, images)
+                truths = decode_seq2seq_labels(tgt.T)
+                all_preds.extend(preds)
+                all_labels.extend(truths)
+
+        return total_loss / len(self.val_loader), compute_cer(all_preds, all_labels)
+
+    def _save_checkpoint(self, epoch: int, val_cer: float, is_best: bool) -> None:
+        filename = "best_seq2seq.pt" if is_best else f"seq2seq_epoch{epoch:03d}.pt"
+        torch.save({
+            "epoch":                epoch,
+            "model_state_dict":     self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "val_cer":              val_cer,
+            "history":              self.history,
+            "arch":                 "seq2seq",
+        }, Path(self.checkpoint_dir) / filename)
+
+    def _save_history(self) -> None:
+        path = Path(self.log_dir) / "history_seq2seq.json"
+        with open(path, "w") as f:
+            json.dump(self.history, f, indent=2)
+        print(f"Verlauf gespeichert: {path}")
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="HTR CRNN Training")
-    parser.add_argument("--dataset",     default="synthetic",     choices=["synthetic", "iam"],
-                        help="Datensatz-Typ (default: synthetic)")
-    parser.add_argument("--data-dir",    default="data/raw",      help="Pfad zum IAM-Datensatz")
-    parser.add_argument("--epochs",      type=int, default=30,    help="Maximale Epochenanzahl")
-    parser.add_argument("--batch-size",  type=int, default=32,    help="Batch-Größe")
-    parser.add_argument("--lr",          type=float, default=1e-3, help="Lernrate")
-    parser.add_argument("--img-height",  type=int, default=32,    help="Bildhöhe")
-    parser.add_argument("--img-width",   type=int, default=128,   help="Bildbreite")
-    parser.add_argument("--lstm-hidden", type=int, default=256,   help="LSTM-Einheiten")
-    parser.add_argument("--patience",    type=int, default=10,    help="Early-Stopping-Patience")
-    parser.add_argument("--workers",     type=int, default=4,     help="DataLoader-Worker")
-    parser.add_argument("--resume",      default=None,            help="Checkpoint zum Fortsetzen")
+    parser = argparse.ArgumentParser(description="HTR Training")
+    parser.add_argument("--arch",         default="crnn",          choices=["crnn", "seq2seq"],
+                        help="Modell-Architektur: crnn (CTC) oder seq2seq (Transformer Decoder)")
+    parser.add_argument("--dataset",     default="synthetic",      choices=["synthetic", "iam"])
+    parser.add_argument("--data-dir",    default="data/raw")
+    parser.add_argument("--epochs",      type=int, default=30)
+    parser.add_argument("--batch-size",  type=int, default=32)
+    parser.add_argument("--lr",          type=float, default=1e-3)
+    parser.add_argument("--img-height",  type=int, default=32)
+    parser.add_argument("--img-width",   type=int, default=128)
+    parser.add_argument("--lstm-hidden", type=int, default=256)
+    parser.add_argument("--patience",    type=int, default=15)
+    parser.add_argument("--workers",     type=int, default=4)
+    parser.add_argument("--resume",      default=None)
     return parser.parse_args()
 
 
@@ -283,48 +476,65 @@ def main() -> None:
     print(f"Gerät: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
-        torch.backends.cudnn.benchmark = True  # schnellsten Algorithmus für feste Eingabegröße finden
+        torch.backends.cudnn.benchmark = True
 
-    # Daten laden
-    train_loader, val_loader = get_dataloaders(
-        dataset_type=args.dataset,
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
-        img_height=args.img_height,
-        img_width=args.img_width,
-        num_workers=args.workers,
-    )
+    if args.arch == "seq2seq":
+        # ── Seq2Seq ──────────────────────────────────────────────────────────
+        train_loader, val_loader = get_seq2seq_dataloaders(
+            dataset_type=args.dataset, data_dir=args.data_dir,
+            batch_size=args.batch_size, img_height=args.img_height,
+            img_width=args.img_width, num_workers=args.workers,
+        )
+        model = build_seq2seq_model(
+            img_height=args.img_height, vocab_size=SEQ2SEQ_VOCAB,
+            lstm_hidden=args.lstm_hidden,
+        )
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Seq2Seq Modell-Parameter: {total_params:,}")
 
-    # Modell erstellen
-    model = build_model(
-        img_height=args.img_height,
-        num_classes=NUM_CLASSES,
-        lstm_hidden=args.lstm_hidden,
-    )
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Modell-Parameter: {total_params:,}")
+        trainer = Seq2SeqTrainer(
+            model=model, train_loader=train_loader, val_loader=val_loader,
+            lr=args.lr, patience=args.patience, device=device,
+        )
+        if args.resume:
+            ck = torch.load(args.resume, map_location=device)
+            model.load_state_dict(ck["model_state_dict"])
+            trainer.optimizer.load_state_dict(ck["optimizer_state_dict"])
+            trainer.best_val_cer = ck.get("val_cer", float("inf"))
+            print(f"Seq2Seq fortgesetzt: {args.resume}  (CER: {trainer.best_val_cer:.4f})")
 
-    # Trainer
-    trainer = Trainer(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        lr=args.lr,
-        patience=args.patience,
-        device=device,
-    )
+        trainer.fit(epochs=args.epochs)
+        print("\nTraining abgeschlossen!")
+        print("Bestes Modell: outputs/checkpoints/best_seq2seq.pt")
 
-    # Optional: Training fortsetzen
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        trainer.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        print(f"Training fortgesetzt von: {args.resume}")
+    else:
+        # ── CRNN (CTC) ───────────────────────────────────────────────────────
+        train_loader, val_loader = get_dataloaders(
+            dataset_type=args.dataset, data_dir=args.data_dir,
+            batch_size=args.batch_size, img_height=args.img_height,
+            img_width=args.img_width, num_workers=args.workers,
+        )
+        model = build_model(
+            img_height=args.img_height, num_classes=NUM_CLASSES,
+            lstm_hidden=args.lstm_hidden,
+        )
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"CRNN Modell-Parameter: {total_params:,}")
 
-    # Training starten
-    trainer.fit(epochs=args.epochs)
-    print("\nTraining abgeschlossen!")
-    print(f"Bestes Modell: outputs/checkpoints/best_model.pt")
+        trainer = Trainer(
+            model=model, train_loader=train_loader, val_loader=val_loader,
+            lr=args.lr, patience=args.patience, device=device,
+        )
+        if args.resume:
+            ck = torch.load(args.resume, map_location=device)
+            model.load_state_dict(ck["model_state_dict"])
+            trainer.optimizer.load_state_dict(ck["optimizer_state_dict"])
+            trainer.best_val_cer = ck.get("val_cer", float("inf"))
+            print(f"Training fortgesetzt: {args.resume}  (CER: {trainer.best_val_cer:.4f})")
+
+        trainer.fit(epochs=args.epochs)
+        print("\nTraining abgeschlossen!")
+        print("Bestes Modell: outputs/checkpoints/best_model.pt")
 
 
 if __name__ == "__main__":

@@ -35,6 +35,12 @@ IDX2CHAR: Dict[int, str] = {i: c for c, i in CHAR2IDX.items()}
 
 NUM_CLASSES = len(ALPHABET)   # 96
 
+# ── Seq2Seq Sondertokens ──────────────────────────────────────────────────────
+PAD_IDX       = 0               # Blank-Index als Padding wiederverwenden
+BOS_IDX       = NUM_CLASSES     # 96  – Beginn der Sequenz
+EOS_IDX       = NUM_CLASSES + 1 # 97  – Ende der Sequenz
+SEQ2SEQ_VOCAB = NUM_CLASSES + 2 # 98  – Gesamtvokabular für Seq2Seq
+
 
 def encode_label(text: str) -> torch.Tensor:
     """Wandelt einen String in einen Tensor aus Klassen-Indizes um."""
@@ -281,6 +287,26 @@ def collate_fn(
     return images, labels, lengths
 
 
+def seq2seq_collate_fn(
+    batch: List[Tuple[torch.Tensor, torch.Tensor, int]]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Collate für Seq2Seq: fügt BOS/EOS hinzu und paddet auf gleiche Länge.
+    Gibt (images, padded_labels) zurück – kein flacher Label-Tensor wie bei CTC.
+    """
+    images, labels, _ = zip(*batch)
+    images = torch.stack(images)
+    seq_labels = [
+        torch.cat([torch.tensor([BOS_IDX]), lbl, torch.tensor([EOS_IDX])])
+        for lbl in labels
+    ]
+    max_len = max(l.size(0) for l in seq_labels)
+    padded = torch.full((len(seq_labels), max_len), PAD_IDX, dtype=torch.long)
+    for i, lbl in enumerate(seq_labels):
+        padded[i, :lbl.size(0)] = lbl
+    return images, padded
+
+
 def get_dataloaders(
     dataset_type: str = "synthetic",
     data_dir: str = "data/raw",
@@ -330,4 +356,27 @@ def get_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
     )
+    return train_loader, val_loader
+
+
+def get_seq2seq_dataloaders(
+    dataset_type: str = "iam",
+    data_dir: str = "data/raw",
+    batch_size: int = 32,
+    img_height: int = 32,
+    img_width: int = 128,
+    num_workers: int = 4,
+) -> Tuple[DataLoader, DataLoader]:
+    """DataLoader für Seq2Seq-Training (BOS/EOS/PAD statt CTC-Format)."""
+    if dataset_type == "iam":
+        train_ds = IAMDataset(data_dir, split="train", img_height=img_height, img_width=img_width, split_mode="random")
+        val_ds   = IAMDataset(data_dir, split="val",   img_height=img_height, img_width=img_width, split_mode="random")
+    else:
+        train_ds = SyntheticHTRDataset(4250, img_height, img_width, split="train")
+        val_ds   = SyntheticHTRDataset(750,  img_height, img_width, split="val", seed=99)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              collate_fn=seq2seq_collate_fn, num_workers=num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                              collate_fn=seq2seq_collate_fn, num_workers=num_workers, pin_memory=True)
     return train_loader, val_loader
