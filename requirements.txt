@@ -26,6 +26,9 @@ tqdm>=4.64.0
 # Evaluation Metriken
 jiwer>=3.0.0
 
+# LM-Decoder (optional, verbessert WER durch Sprachmodell-Scoring)
+pyctcdecode>=0.4.0
+
 # Streamlit UI (Bonus)
 streamlit>=1.20.0
 

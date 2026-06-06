@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from src.dataset import ALPHABET, NUM_CLASSES, decode_label
 from src.model import build_model
-from utils.ctc_decoder import greedy_decode, beam_search_decode
+from utils.ctc_decoder import greedy_decode, beam_search_decode, lm_decode
 from utils.visualization import show_predictions
 
 
@@ -122,6 +122,8 @@ def evaluate_model(
 
             if decoder == "beam":
                 preds = beam_search_decode(log_probs)
+            elif decoder == "lm":
+                preds = lm_decode(log_probs, beam_width=25)
             else:
                 preds = greedy_decode(log_probs)
             truths = decode_batch_labels(labels, label_lengths)
@@ -174,8 +176,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--img-height", type=int, default=32)
     parser.add_argument("--img-width",  type=int, default=128)
-    parser.add_argument("--decoder",    default="greedy", choices=["greedy", "beam"],
-                        help="Decoder-Typ: greedy (schnell) oder beam (besser, langsamer)")
+    parser.add_argument("--decoder",    default="lm", choices=["greedy", "beam", "lm"],
+                        help="Decoder-Typ: greedy (schnell), beam (besser), lm (best, pyctcdecode)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -22,7 +22,7 @@ from PIL import Image
 from src.dataset import NUM_CLASSES
 from src.model import build_model
 from src.transforms import get_val_transforms
-from utils.ctc_decoder import greedy_decode, beam_search_decode
+from utils.ctc_decoder import greedy_decode, beam_search_decode, lm_decode
 
 
 class HTRPredictor:
@@ -85,6 +85,8 @@ class HTRPredictor:
 
         if self.decoder == "beam":
             results = beam_search_decode(log_probs, beam_width=10)
+        elif self.decoder == "lm":
+            results = lm_decode(log_probs, beam_width=25)
         else:
             results = greedy_decode(log_probs)
 
@@ -104,6 +106,8 @@ class HTRPredictor:
 
         if self.decoder == "beam":
             return beam_search_decode(log_probs, beam_width=10)
+        if self.decoder == "lm":
+            return lm_decode(log_probs, beam_width=25)
         return greedy_decode(log_probs)
 
 
@@ -116,7 +120,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True, help="Checkpoint-Datei (.pt)")
     parser.add_argument("--img-height", type=int, default=32)
     parser.add_argument("--img-width",  type=int, default=128)
-    parser.add_argument("--decoder",    default="greedy", choices=["greedy", "beam"])
+    parser.add_argument("--decoder",    default="lm", choices=["greedy", "beam", "lm"])
     args = parser.parse_args()
 
     predictor = HTRPredictor(

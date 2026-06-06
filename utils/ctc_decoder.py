@@ -1,16 +1,18 @@
 """
 CTC-Decoder: wandelt Modellausgaben (Log-Wahrscheinlichkeiten) in lesbaren Text um.
 
-Zwei Varianten:
-  - Greedy Decoder:      schnell, gut für Training und schnelle Evaluation
-  - Beam Search Decoder: langsamer, aber messbar besser bei verrauschten Ausgaben
+Drei Varianten:
+  - Greedy Decoder:         schnell, gut für Training und schnelle Evaluation
+  - Beam Search Decoder:    langsamer, aber messbar besser bei verrauschten Ausgaben
+  - LM Beam Search Decoder: Beam Search + Sprachmodell via pyctcdecode (optional KenLM)
 """
 
-from typing import List
+from pathlib import Path
+from typing import List, Optional
 import numpy as np
 import torch
 
-from src.dataset import IDX2CHAR, BLANK_TOKEN
+from src.dataset import IDX2CHAR, BLANK_TOKEN, ALPHABET
 
 BLANK_IDX = 0
 
@@ -104,3 +106,44 @@ def beam_search_decode(
             results.append("")
 
     return results
+
+
+def lm_decode(
+    log_probs: torch.Tensor,
+    beam_width: int = 25,
+    lm_path: Optional[str] = None,
+) -> List[str]:
+    """
+    Beam Search mit optionalem KenLM-Sprachmodell via pyctcdecode.
+    Fällt auf beam_search_decode zurück wenn pyctcdecode nicht installiert ist.
+
+    Args:
+        log_probs:  (SeqLen, Batch, NumClasses) – Modellausgabe
+        beam_width: Anzahl der Hypothesen (höher = besser, langsamer)
+        lm_path:    Optionaler Pfad zu einer .arpa oder .binary KenLM-Datei
+
+    Returns:
+        Liste von dekodiertem Text
+    """
+    try:
+        from pyctcdecode import build_ctcdecoder
+
+        # pyctcdecode erwartet leeren String "" als Blank-Token an Index 0
+        labels = [""] + list(ALPHABET[1:])
+
+        kenlm_model = lm_path if (lm_path and Path(lm_path).exists()) else None
+        decoder = build_ctcdecoder(labels, kenlm_model=kenlm_model)
+
+        lp = log_probs.detach().cpu().numpy()   # (SeqLen, Batch, NumClasses)
+        _, batch_size, _ = lp.shape
+
+        results: List[str] = []
+        for b in range(batch_size):
+            logits_b = lp[:, b, :]              # (SeqLen, NumClasses)
+            text = decoder.decode(logits_b, beam_width=beam_width)
+            results.append(text)
+        return results
+
+    except Exception:
+        # Fallback: eigener Beam Search wenn pyctcdecode fehlt oder fehlschlägt
+        return beam_search_decode(log_probs, beam_width=beam_width)

@@ -15,7 +15,7 @@ from PIL import Image
 from src.dataset import NUM_CLASSES, ALPHABET
 from src.model import build_model
 from src.transforms import get_val_transforms
-from utils.ctc_decoder import greedy_decode, beam_search_decode
+from utils.ctc_decoder import greedy_decode, beam_search_decode, lm_decode
 
 
 # ── Seitenkonfiguration ───────────────────────────────────────────────────────
@@ -325,6 +325,8 @@ def predict_image(image: Image.Image, model, transform, device, decoder: str = "
 
     if decoder == "Beam Search":
         return beam_search_decode(log_probs, beam_width=10)[0]
+    if decoder == "LM Beam Search":
+        return lm_decode(log_probs, beam_width=25)[0]
     return greedy_decode(log_probs)[0]
 
 
@@ -357,8 +359,8 @@ def main() -> None:
 
         decoder = st.radio(
             "Decoder-Methode",
-            ["Greedy", "Beam Search"],
-            index=0,
+            ["Greedy", "Beam Search", "LM Beam Search"],
+            index=2,
             label_visibility="collapsed",
         )
 
