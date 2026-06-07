@@ -47,6 +47,77 @@ class ResizeToHeight:
         return img
 
 
+def ensure_training_polarity(img: Image.Image) -> Image.Image:
+    """
+    Bringt ein Eingabebild auf die Trainings-Polarität: **helle Schrift auf dunklem Grund**
+    (so wie das IAM-Training, das die Bilder via ImageOps.invert umdreht).
+
+    Hintergrund wird am Median-Pixel erkannt: ist der Hintergrund hell (normales Foto/Scan
+    mit dunkler Tinte auf hellem Papier), wird invertiert. Ist er bereits dunkel, bleibt es.
+
+    WICHTIG: Ohne diesen Schritt sieht das Modell bei Uploads die vertauschte Polarität und
+    liefert Kauderwelsch – obwohl es auf IAM exzellent abschneidet.
+    """
+    gray = img.convert("L")
+    arr = np.asarray(gray)
+    if np.median(arr) > 127:          # heller Hintergrund → invertieren
+        return ImageOps.invert(gray)
+    return gray
+
+
+def deslant_image(img: Image.Image, max_shear: float = 0.4, steps: int = 17) -> Image.Image:
+    """
+    Deslanting: korrigiert die Schräglage (Kursivität) eines Handschriftbildes.
+
+    Klassische HTR-Vorverarbeitung (Vinciarelli & Luettin): Das Bild wird über eine
+    Reihe von Scherwinkeln geschert; gewählt wird der Winkel, der die Tinte am stärksten
+    in wenige Spalten konzentriert (Summe der quadrierten Spaltensummen maximal). Dann
+    stehen die senkrechten Striche tatsächlich senkrecht – das reduziert Form-Verwechslungen
+    (o/c, B/s, t/r) und verkleinert die Variation, über die das Modell generalisieren muss.
+
+    Polaritäts-robust: funktioniert für dunkle Schrift auf hellem Grund und umgekehrt.
+    """
+    arr = np.asarray(img.convert("L"))
+    h, w = arr.shape
+    if h < 3 or w < 3:
+        return img
+
+    # Binarisieren (Otsu); Tinte = Minderheitsklasse als 255
+    _, binimg = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if binimg.mean() > 127:
+        binimg = 255 - binimg
+
+    best_score, best_shear = -1.0, 0.0
+    for shear in np.linspace(-max_shear, max_shear, steps):
+        tx = -shear * h / 2.0
+        M = np.float32([[1, shear, tx], [0, 1, 0]])
+        sheared = cv2.warpAffine(binimg, M, (w, h), flags=cv2.INTER_NEAREST, borderValue=0)
+        colsum = sheared.sum(axis=0, dtype=np.float64) / 255.0
+        score = float((colsum * colsum).sum())   # konzentrierte Spalten → höherer Score
+        if score > best_score:
+            best_score, best_shear = score, shear
+
+    if abs(best_shear) < 1e-3:
+        return img
+
+    bg = int(np.median(arr))   # Hintergrundfarbe schätzen (für die Ränder)
+    tx = -best_shear * h / 2.0
+    M = np.float32([[1, best_shear, tx], [0, 1, 0]])
+    out = cv2.warpAffine(arr, M, (w, h), flags=cv2.INTER_LINEAR, borderValue=bg)
+    return Image.fromarray(out)
+
+
+class Deslant:
+    """Deslanting als Transform-Schritt (deterministisch, für Training UND Inferenz identisch)."""
+
+    def __init__(self, max_shear: float = 0.4, steps: int = 17) -> None:
+        self.max_shear = max_shear
+        self.steps = steps
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        return deslant_image(img, self.max_shear, self.steps)
+
+
 class AddGaussianNoise:
     """Fügt Gaußsches Rauschen zum Bild hinzu (Augmentation)."""
 
@@ -79,13 +150,15 @@ class RandomDilateErode:
         return Image.fromarray(arr)
 
 
-def get_train_transforms(img_height: int = 32, img_width: int = 128) -> T.Compose:
+def get_train_transforms(img_height: int = 32, img_width: int = 128, deslant: bool = False) -> T.Compose:
     """
     Augmentation-Pipeline für das Training.
-    Reihenfolge: geometrische Ops → Textur-Ops → Tensor-Konvertierung → Normalisierung
+    Reihenfolge: (Deslant) → geometrische Ops → Textur-Ops → Tensor-Konvertierung → Normalisierung
     """
-    return T.Compose([
-        T.Grayscale(num_output_channels=1),
+    steps: list = [T.Grayscale(num_output_channels=1)]
+    if deslant:
+        steps.append(Deslant())               # Schräglage VOR Resize korrigieren
+    steps += [
         ResizeToHeight(img_height, img_width),
         T.RandomRotation(degrees=5, fill=255),                        # Neigung bis 5°
         T.RandomAffine(degrees=0, shear=8, fill=255),                 # stärkere Scherung
@@ -96,17 +169,22 @@ def get_train_transforms(img_height: int = 32, img_width: int = 128) -> T.Compos
         T.ToTensor(),
         T.Normalize(mean=[0.5], std=[0.5]),
         AddGaussianNoise(std=0.03),                                    # etwas mehr Rauschen
-    ])
+    ]
+    return T.Compose(steps)
 
 
-def get_val_transforms(img_height: int = 32, img_width: int = 128) -> T.Compose:
+def get_val_transforms(img_height: int = 32, img_width: int = 128, deslant: bool = False) -> T.Compose:
     """
     Validierungs-/Inferenz-Pipeline: nur deterministisches Preprocessing.
     Keine Augmentation, damit Evaluation reproduzierbar ist.
+    Deslant muss identisch zum Training gesetzt sein!
     """
-    return T.Compose([
-        T.Grayscale(num_output_channels=1),
+    steps: list = [T.Grayscale(num_output_channels=1)]
+    if deslant:
+        steps.append(Deslant())
+    steps += [
         ResizeToHeight(img_height, img_width),
         T.ToTensor(),
         T.Normalize(mean=[0.5], std=[0.5]),
-    ])
+    ]
+    return T.Compose(steps)

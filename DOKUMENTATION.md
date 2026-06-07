@@ -6,7 +6,7 @@ Dieses Projekt erkennt handgeschriebene Wörter automatisch mithilfe neuronaler 
 
 ## Was das Projekt macht
 
-Das Modell nimmt ein Bild eines handgeschriebenen Wortes und gibt den erkannten Text zurück. Jedes Eingabebild wird automatisch auf **32×128 Pixel** skaliert — egal wie groß das Original ist. Trainiert wurde es auf dem **IAM Handwriting Dataset** – einer Sammlung von tausenden echten Handschriftproben.
+Das Modell nimmt ein Bild eines handgeschriebenen Wortes und gibt den erkannten Text zurück. Jedes Eingabebild wird automatisch auf **32×256 Pixel** skaliert — egal wie groß das Original ist. Trainiert wurde es auf dem **IAM Handwriting Dataset** – einer Sammlung von tausenden echten Handschriftproben.
 
 **Beispiel:**
 ```
@@ -23,7 +23,7 @@ Das Projekt implementiert **zwei Modell-Architekturen**, die beide trainiert und
 ### Architektur 1 – CRNN (CTC)
 
 ```
-Bild (32×128) → CNN → BiLSTM → Linear → CTC-Decoder → Text
+Bild (32×256) → CNN → BiLSTM → Linear → CTC-Decoder → Text
 ```
 
 Das klassische Modell. Der CTC-Decoder (Connectionist Temporal Classification) wandelt die Ausgabe-Wahrscheinlichkeiten in Text um, ohne dass eine pixelgenaue Ausrichtung zwischen Bild und Label benötigt wird.
@@ -33,7 +33,7 @@ Das klassische Modell. Der CTC-Decoder (Connectionist Temporal Classification) w
 ### Architektur 2 – CNN + BiLSTM + Transformer Decoder (Seq2Seq)
 
 ```
-Bild (32×128) → CNN → BiLSTM → Transformer Decoder → Text
+Bild (32×256) → CNN → BiLSTM → Transformer Decoder → Text
 ```
 
 Neuere Architektur mit autoregressivem Decoder. Statt CTC generiert ein Transformer-Decoder die Ausgabe Zeichen für Zeichen und berücksichtigt dabei alle bisher generierten Zeichen (eingebautes Sprachwissen durch Self-Attention). Training mit **Teacher Forcing**, Inferenz autoregressiv.
@@ -50,21 +50,21 @@ Neuere Architektur mit autoregressivem Decoder. Statt CTC generiert ein Transfor
 
 | Block | Kanäle | Ausgabe (H×W) |
 |-------|--------|---------------|
-| 1 | 1 → 64 | 16×64 |
-| 2 | 64 → 128 | 8×32 |
-| 3 | 128 → 256 | 8×32 |
-| 4 | 256 → 256 | 4×32 |
-| 5 | 256 → 512 | 4×32 |
-| 6 | 512 → 512 | 2×32 |
-| 7 | 512 → 512 | 2×32 |
+| 1 | 1 → 64 | 16×128 |
+| 2 | 64 → 128 | 8×64 |
+| 3 | 128 → 256 | 8×64 |
+| 4 | 256 → 256 | 4×64 |
+| 5 | 256 → 512 | 4×64 |
+| 6 | 512 → 512 | 2×64 |
+| 7 | 512 → 512 | 2×64 |
 
-Nach dem CNN liegen 32 Feature-Spalten vor, jede mit 1024 Werten (512 Kanäle × 2 Höhe).
+Nach dem CNN liegen 64 Feature-Spalten vor, jede mit 1024 Werten (512 Kanäle × 2 Höhe). Doppelt so viele Spalten wie bei 128px Breite — entscheidend für CTC (mehr Zeitschritte) und weniger Beschneidung langer Wörter.
 
 ### BiLSTM Encoder (identisch in beiden Architekturen)
 
 - 2 gestapelte bidirektionale LSTM-Schichten
 - 256 Units pro Richtung → 512 Ausgabe-Features
-- Liest die 32 Feature-Spalten als Zeitsequenz vorwärts und rückwärts
+- Liest die 64 Feature-Spalten als Zeitsequenz vorwärts und rückwärts
 - Dropout 0.3 zwischen den Schichten
 
 ### CTC-Decoder (nur CRNN)
@@ -81,6 +81,7 @@ Nach dem CNN liegen 32 Feature-Spalten vor, jede mit 1024 Werten (512 Kanäle ×
 - Feed-Forward-Dimension: 1024 (d_model × 4)
 - Autoregressive Ausgabe: ein Token pro Schritt bis EOS
 - Sondertokens: PAD=0, BOS=96, EOS=97 (Vocab-Größe: 98)
+- Training mit **Label Smoothing 0.1** (`CrossEntropyLoss`): verhindert Übervertrauen und verbessert die Generalisierung — Standard bei Transformer-Decodern
 
 ### Gegenüberstellung
 
@@ -124,7 +125,7 @@ AKI_HTA/
 │
 ├── utils/
 │   ├── ctc_decoder.py    ← Greedy, Beam Search, LM Beam Search (GPU-optimiert)
-│   ├── seq2seq_decoder.py← Autoregressive Greedy Decode für Seq2Seq
+│   ├── seq2seq_decoder.py← Autoregressive Greedy + Beam Search Decode für Seq2Seq
 │   └── visualization.py  ← Trainingskurven und Beispielplots
 │
 ├── outputs/
@@ -139,12 +140,15 @@ AKI_HTA/
 
 ---
 
-## Warum 32×128 Pixel?
+## Warum 32×256 Pixel?
 
-Diese Größe kommt aus dem originalen CRNN-Paper (Shi et al., 2016) und ist der Standard für wortbasierte HTR:
+- **32px Höhe** — reicht aus um alle Striche und Kurven eines Buchstabens zu erfassen. Mehr Pixel (z.B. 64) würden kaum mehr Information liefern, aber die Trainingszeit stark erhöhen **und die Modell-Gewichte ändern** (die LSTM-Eingabedimension hängt an der Höhe → kein Weitertrainieren bestehender Checkpoints möglich).
+- **256px Breite** — ursprünglich 128px (CRNN-Paper, Shi et al. 2016), hier auf 256px erhöht. Begründung:
+  - **Mehr Zeitschritte für CTC.** Nach dem CNN ergeben 256px → 64 Feature-Spalten (statt 32). CTC benötigt mindestens so viele Zeitschritte wie Zeichen (mit Blanks ~2× so viele) — 32 Spalten waren bei langen Wörtern eine harte Obergrenze.
+  - **Weniger Beschneidung.** Bei 128px wurden lange Wörter rechts abgeschnitten (`ResizeToHeight`), während das Label vollständig blieb → unlernbare Zeichen. 256px fasst die meisten IAM-Wörter ohne Verlust.
+  - **Die Breite ändert keine Gewichts-Shapes** (nur die Höhe tut das) — bestehende Checkpoints lassen sich mit `--img-width 256` ohne Neustart weitertrainieren.
 
-- **32px Höhe** — reicht aus um alle Striche und Kurven eines Buchstabens zu erfassen. Mehr Pixel würden kaum mehr Information liefern, aber die Trainingszeit stark erhöhen.
-- **128px Breite** — passt für die meisten Wörter. Längere Wörter werden gestaucht, kürzere aufgefüllt.
+> **Wichtig:** Training und Inferenz (`predict.py`, `app.py`) müssen dieselbe Breite verwenden, sonst sieht das Modell bei der Vorhersage eine andere Stauchung als beim Training.
 
 ---
 
@@ -174,8 +178,11 @@ python -m training.train --arch seq2seq --dataset iam --data-dir data/raw --epoc
 # CRNN mit LM Beam Search (Standard)
 python predict.py --image mein_bild.png --checkpoint outputs/checkpoints/best_model.pt
 
-# Seq2Seq (Transformer Decoder)
+# Seq2Seq (Transformer Decoder) – Beam Search (Standard)
 python predict.py --image mein_bild.png --checkpoint outputs/checkpoints/best_seq2seq.pt --arch seq2seq
+
+# Seq2Seq – Greedy statt Beam
+python predict.py --image mein_bild.png --checkpoint outputs/checkpoints/best_seq2seq.pt --arch seq2seq --decoder greedy
 
 # Ordner mit mehreren Bildern
 python predict.py --folder data/sample_images/ --checkpoint outputs/checkpoints/best_model.pt
@@ -194,10 +201,17 @@ Browser öffnet sich unter `http://localhost:8501`. In der Sidebar kann man zwis
 ### Evaluation
 
 ```powershell
+# Ehrliche Endzahl: Test-Set + ungesehene Schreiber (Standard)
 python -m evaluation.evaluate --checkpoint outputs/checkpoints/best_model.pt --dataset iam --data-dir data/raw
+
+# Seq2Seq mit Beam Search
+python -m evaluation.evaluate --checkpoint outputs/checkpoints/best_seq2seq.pt --arch seq2seq --dataset iam --data-dir data/raw
 ```
 
 Gibt **CER** (Character Error Rate), **WER** (Word Error Rate) und **Char Accuracy** aus.
+
+Wichtige Flags: `--arch crnn|seq2seq`, `--split test|val`, `--split-mode random|author`.
+**Standard ist `--split test --split-mode random`** — der `--split-mode` muss zum Training passen. Da standardmäßig mit `random` trainiert wird (alle Schreiber gesehen), misst der `test`-Split ungesehene **Samples**, aber keine ungesehenen **Schreiber**. Ein echter neue-Schreiber-Test (`--split-mode author`) ist nur aussagekräftig, wenn auch mit `author` trainiert wurde.
 
 ---
 
@@ -227,16 +241,32 @@ Alle drei Decoder laufen GPU-optimiert: Die Wahrscheinlichkeiten werden mit `tor
 
 ### Seq2Seq (Transformer Decoder) – autoregressiv
 
-Der Seq2Seq-Decoder benötigt keine separaten CTC-Decoder-Varianten. Er generiert Zeichen direkt autoregressiv:
+Der Seq2Seq-Decoder generiert Zeichen autoregressiv:
 
 1. Start mit `BOS`-Token (Index 96)
-2. Transformer Decoder berechnet das nächste wahrscheinlichste Zeichen
+2. Transformer Decoder berechnet das nächste Zeichen
 3. Dieses Zeichen wird als nächste Eingabe verwendet
 4. Wiederholen bis `EOS`-Token (Index 97) oder maximale Länge
 
 Der Decoder "sieht" alle bereits generierten Zeichen durch Self-Attention — das entspricht einem eingebauten Sprachmodell.
 
+Es gibt zwei Decode-Strategien:
+
+| Decoder | Geschwindigkeit | Qualität | Beschreibung |
+|---------|----------------|----------|-------------|
+| **Greedy** | Schnell | Basis | Nimmt bei jedem Schritt das wahrscheinlichste Token |
+| **Beam Search** *(Standard)* | Langsamer | Besser | Verfolgt `beam_width=5` Hypothesen parallel und wählt am Ende die global wahrscheinlichste Sequenz; Längen-Normalisierung (Penalty 0.6) gegen die Bevorzugung kurzer Ausgaben |
+
+Beam Search korrigiert frühe Fehlentscheidungen, die Greedy nicht mehr revidieren kann, und bringt typischerweise einige Prozent CER. In `predict.py` und der Web-Demo ist Beam Search der Standard; Greedy ist über `--decoder greedy` weiterhin wählbar.
+
 ---
+
+## Training-Details
+
+- **Optimizer: AdamW** – entkoppelter Weight Decay (`1e-4`), korrekte L2-Regularisierung → bessere Generalisierung als das frühere `Adam`
+- **LR-Warmup:** linearer Anstieg über die ersten `--warmup-steps` (Standard 500) Schritte, stabilisiert den instabilen Transformer-Start. Nur bei Neustart, nicht beim Resume (dort ist die LR bereits eingependelt)
+- **Scheduler:** `ReduceLROnPlateau` halbiert die LR bei stagnierender Val-Loss
+- **Label Smoothing 0.1** (nur Seq2Seq): gegen Übervertrauen
 
 ## GPU-Optimierungen
 
@@ -263,3 +293,5 @@ Browser: `http://localhost:6006` – zeigt Loss und CER in Echtzeit für beide A
 - Modelldateien (`.pt`) sind zu groß für Git – lokal aufbewahren
 - Bei Trainingsunterbrechung immer `--resume` verwenden um Fortschritt nicht zu verlieren
 - Seq2Seq braucht mehr Epochen bis es konvergiert (Patience 15 statt 10 empfohlen)
+- Beim `--resume` wird die **gespeicherte Lernrate beibehalten** (ggf. bereits abgesenkt), damit das Modell sauber auskonvergiert. Mit `--reset-lr` wird sie stattdessen auf `--lr` zurückgesetzt — nützlich beim ersten Resume oder wenn die LR durch viele Neustarts zu klein geworden ist.
+- Für maximale Genauigkeit besser **ein langer Lauf** (hohe `--epochs` + `--patience`) als viele kurze Neustart-Runden: so verwaltet ein einziger Scheduler die Lernrate durchgehend.

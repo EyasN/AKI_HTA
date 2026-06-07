@@ -21,9 +21,9 @@ from PIL import Image
 
 from src.dataset import NUM_CLASSES, SEQ2SEQ_VOCAB
 from src.model import build_model, build_seq2seq_model
-from src.transforms import get_val_transforms
+from src.transforms import get_val_transforms, ensure_training_polarity
 from utils.ctc_decoder import greedy_decode, beam_search_decode, lm_decode
-from utils.seq2seq_decoder import seq2seq_greedy_decode
+from utils.seq2seq_decoder import seq2seq_greedy_decode, seq2seq_beam_decode
 
 
 class HTRPredictor:
@@ -37,9 +37,10 @@ class HTRPredictor:
         checkpoint_path: str,
         arch:       str = "crnn",
         img_height: int = 32,
-        img_width:  int = 128,
+        img_width:  int = 256,
         decoder:    str = "greedy",
         device:     str = "auto",
+        deslant:    bool = False,
     ) -> None:
         if device == "auto":
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -48,13 +49,18 @@ class HTRPredictor:
 
         self.arch      = arch
         self.decoder   = decoder
-        self.transform = get_val_transforms(img_height, img_width)
 
         checkpoint  = torch.load(checkpoint_path, map_location=self.device)
         sd          = checkpoint["model_state_dict"]
         lstm_hidden = (sd["rnn.weight_hh_l0"].shape[0] // 4
                        if "rnn.weight_hh_l0" in sd
                        else checkpoint.get("lstm_hidden", 256))
+
+        # Config aus dem Checkpoint übernehmen, falls vorhanden (sonst CLI-Werte)
+        img_height = checkpoint.get("img_height", img_height)
+        img_width  = checkpoint.get("img_width",  img_width)
+        deslant    = checkpoint.get("deslant",    deslant)
+        self.transform = get_val_transforms(img_height, img_width, deslant=deslant)
 
         if arch == "seq2seq":
             self.model = build_seq2seq_model(img_height=img_height, vocab_size=SEQ2SEQ_VOCAB,
@@ -70,14 +76,16 @@ class HTRPredictor:
         epoch   = checkpoint.get("epoch", "?")
         val_cer = checkpoint.get("val_cer", "?")
         print(f"Modell geladen ({arch}): Epoch {epoch}, Val-CER: {val_cer}")
-        print(f"Gerät: {self.device} | Decoder: {decoder}")
+        print(f"Gerät: {self.device} | Decoder: {decoder} | {img_height}x{img_width} | Deslant: {deslant}")
 
     def predict(self, image_path: str) -> str:
-        img    = Image.open(image_path).convert("L")
+        img    = ensure_training_polarity(Image.open(image_path))
         tensor = self.transform(img).unsqueeze(0).to(self.device)
 
         if self.arch == "seq2seq":
-            return seq2seq_greedy_decode(self.model, tensor)[0]
+            if self.decoder == "greedy":
+                return seq2seq_greedy_decode(self.model, tensor)[0]
+            return seq2seq_beam_decode(self.model, tensor, beam_width=5)[0]
 
         with torch.no_grad():
             log_probs = self.model(tensor)
@@ -89,11 +97,13 @@ class HTRPredictor:
         return greedy_decode(log_probs)[0]
 
     def predict_batch(self, image_paths: List[str]) -> List[str]:
-        tensors = [self.transform(Image.open(p).convert("L")) for p in image_paths]
+        tensors = [self.transform(ensure_training_polarity(Image.open(p))) for p in image_paths]
         batch   = torch.stack(tensors, dim=0).to(self.device)
 
         if self.arch == "seq2seq":
-            return seq2seq_greedy_decode(self.model, batch)
+            if self.decoder == "greedy":
+                return seq2seq_greedy_decode(self.model, batch)
+            return seq2seq_beam_decode(self.model, batch, beam_width=5)
 
         with torch.no_grad():
             log_probs = self.model(batch)
@@ -114,9 +124,11 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--arch",       default="crnn",  choices=["crnn", "seq2seq"])
     parser.add_argument("--img-height", type=int, default=32)
-    parser.add_argument("--img-width",  type=int, default=128)
+    parser.add_argument("--img-width",  type=int, default=256)
     parser.add_argument("--decoder",    default="lm", choices=["greedy", "beam", "lm"],
-                        help="Decoder für CRNN; ignoriert bei --arch seq2seq")
+                        help="CRNN: greedy/beam/lm. Seq2Seq: 'greedy' = Greedy, sonst Beam Search.")
+    parser.add_argument("--deslant",    action="store_true",
+                        help="Deslanting (Fallback, falls nicht im Checkpoint vermerkt).")
     args = parser.parse_args()
 
     predictor = HTRPredictor(
@@ -125,6 +137,7 @@ def main() -> None:
         img_height=args.img_height,
         img_width=args.img_width,
         decoder=args.decoder,
+        deslant=args.deslant,
     )
 
     if args.image:

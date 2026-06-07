@@ -14,9 +14,9 @@ from PIL import Image
 
 from src.dataset import NUM_CLASSES, SEQ2SEQ_VOCAB, ALPHABET
 from src.model import build_model, build_seq2seq_model
-from src.transforms import get_val_transforms
+from src.transforms import get_val_transforms, ensure_training_polarity
 from utils.ctc_decoder import greedy_decode, beam_search_decode, lm_decode
-from utils.seq2seq_decoder import seq2seq_greedy_decode
+from utils.seq2seq_decoder import seq2seq_greedy_decode, seq2seq_beam_decode
 
 
 # ── Seitenkonfiguration ───────────────────────────────────────────────────────
@@ -308,6 +308,11 @@ def load_model(checkpoint_path: str, arch: str, img_height: int, img_width: int)
                        if "rnn.weight_hh_l0" in sd
                        else checkpoint.get("lstm_hidden", 256))
 
+        # Config aus dem Checkpoint übernehmen (überschreibt UI-Werte) – kein Mismatch-Risiko
+        img_height = checkpoint.get("img_height", img_height)
+        img_width  = checkpoint.get("img_width",  img_width)
+        deslant    = checkpoint.get("deslant",    False)
+
         if arch == "seq2seq":
             model = build_seq2seq_model(img_height=img_height, vocab_size=SEQ2SEQ_VOCAB,
                                         lstm_hidden=lstm_hidden)
@@ -319,32 +324,39 @@ def load_model(checkpoint_path: str, arch: str, img_height: int, img_width: int)
         epoch   = checkpoint.get("epoch", "?")
         val_cer = checkpoint.get("val_cer", None)
         info    = {"epoch": epoch, "val_cer": val_cer, "loaded": True,
-                   "arch": arch, "lstm_hidden": lstm_hidden}
+                   "arch": arch, "lstm_hidden": lstm_hidden,
+                   "img_height": img_height, "img_width": img_width, "deslant": deslant}
     except (FileNotFoundError, RuntimeError) as e:
         st.warning(f"Checkpoint nicht gefunden: {e}\nModell hat zufällige Gewichte.")
         lstm_hidden = 256
+        deslant     = False
         if arch == "seq2seq":
             model = build_seq2seq_model(img_height=img_height, vocab_size=SEQ2SEQ_VOCAB)
         else:
             model = build_model(img_height=img_height, num_classes=NUM_CLASSES)
         info = {"epoch": 0, "val_cer": None, "loaded": False,
-                "arch": arch, "lstm_hidden": lstm_hidden}
+                "arch": arch, "lstm_hidden": lstm_hidden,
+                "img_height": img_height, "img_width": img_width, "deslant": deslant}
 
     model.to(device)
     model.eval()
-    transform = get_val_transforms(img_height, img_width)
+    transform = get_val_transforms(img_height, img_width, deslant=deslant)
     return model, transform, device, info
 
 
 def predict_image(image: Image.Image, model, transform, device, arch: str = "crnn", decoder: str = "greedy"):
-    img_gray = image.convert("L")
-    preprocessed_pil = img_gray.resize((128, 32), Image.LANCZOS)
+    img_gray = ensure_training_polarity(image)   # auf Trainings-Polarität bringen (sonst Kauderwelsch)
+    preprocessed_pil = img_gray.resize((256, 32), Image.LANCZOS)
     tensor = transform(img_gray).unsqueeze(0).to(device)
 
     if arch == "seq2seq":
-        text       = seq2seq_greedy_decode(model, tensor)[0]
-        confidence = 100.0
-        candidates = [("Seq2Seq Greedy", text)]
+        texts, confs = seq2seq_beam_decode(model, tensor, beam_width=5, return_confidence=True)
+        text       = texts[0]
+        confidence = confs[0] * 100      # mittlere Token-Wahrscheinlichkeit der besten Hypothese
+        greedy_txt = seq2seq_greedy_decode(model, tensor)[0]
+        candidates = [("Seq2Seq Beam", text)]
+        if greedy_txt != text:
+            candidates.append(("Seq2Seq Greedy", greedy_txt))
         return text, confidence, preprocessed_pil, candidates
 
     with torch.no_grad():
@@ -405,14 +417,14 @@ def main() -> None:
         )
         checkpoint_path = st.text_input("Checkpoint-Pfad", value=default_ckpt)
         img_height = st.number_input("Bild-Höhe (px)", min_value=16, max_value=64, value=32)
-        img_width  = st.number_input("Bild-Breite (px)", min_value=64, max_value=512, value=128)
+        img_width  = st.number_input("Bild-Breite (px)", min_value=64, max_value=512, value=256)
 
         st.markdown('<hr class="fancy-divider">', unsafe_allow_html=True)
         st.markdown('<div class="section-label">Decoder</div>', unsafe_allow_html=True)
 
         if arch_key == "seq2seq":
-            decoder = "Seq2Seq Greedy"
-            st.markdown('<span style="color:#7c6faa;font-size:0.85rem;">Seq2Seq nutzt autoregressives Greedy Decoding</span>', unsafe_allow_html=True)
+            decoder = "Seq2Seq Beam"
+            st.markdown('<span style="color:#7c6faa;font-size:0.85rem;">Seq2Seq nutzt autoregressives Beam Search (beam_width=5)</span>', unsafe_allow_html=True)
         else:
             decoder = st.radio(
                 "Decoder-Methode",
@@ -445,6 +457,14 @@ def main() -> None:
           <div class="info-row">
             <span class="info-label">LSTM Hidden</span>
             <span class="info-value">{info.get("lstm_hidden", 256)}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Bildgröße</span>
+            <span class="info-value">{info.get("img_height", img_height)}×{info.get("img_width", img_width)}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Deslant</span>
+            <span class="info-value">{"an" if info.get("deslant") else "aus"}</span>
           </div>
           <div class="info-row">
             <span class="info-label">Klassen</span>
@@ -493,7 +513,7 @@ def main() -> None:
 
             st.markdown("<br>", unsafe_allow_html=True)
             if "prediction" in st.session_state:
-                st.markdown('<div class="section-label" style="margin-top:1rem; font-size:0.7rem;">Was das Modell sieht (32×128 px)</div>', unsafe_allow_html=True)
+                st.markdown('<div class="section-label" style="margin-top:1rem; font-size:0.7rem;">Was das Modell sieht (32×256 px)</div>', unsafe_allow_html=True)
                 st.image(st.session_state["prediction"]["preprocessed"], use_container_width=True)
 
             st.markdown("<br>", unsafe_allow_html=True)

@@ -168,36 +168,139 @@ def evaluate_model(
     return cer, wer
 
 
+def evaluate_seq2seq_model(
+    model: torch.nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    device: torch.device,
+    decoder: str = "beam",
+) -> Tuple[float, float]:
+    """
+    Evaluation für das Seq2Seq-Modell (autoregressiver Transformer-Decoder).
+
+    Args:
+        model:      Trainiertes CRNN_Seq2Seq-Modell
+        dataloader: DataLoader im Seq2Seq-Format (images, padded_labels)
+        device:     torch.device
+        decoder:    "beam" (Standard) oder "greedy"
+
+    Returns:
+        (cer, wer)
+    """
+    from utils.seq2seq_decoder import (
+        seq2seq_beam_decode, seq2seq_greedy_decode, decode_seq2seq_labels,
+    )
+
+    model.eval()
+    all_preds:  List[str] = []
+    all_labels: List[str] = []
+
+    with torch.no_grad():
+        for images, padded in tqdm(dataloader, desc="Evaluation"):
+            images = images.to(device)
+            if decoder == "greedy":
+                preds = seq2seq_greedy_decode(model, images)
+            else:
+                preds = seq2seq_beam_decode(model, images, beam_width=5)
+            all_preds.extend(preds)
+            all_labels.extend(decode_seq2seq_labels(padded))
+
+    cer = compute_cer(all_preds, all_labels)
+    wer = compute_wer(all_preds, all_labels)
+
+    print(f"\n{'='*45}")
+    print(f"  Evaluation Ergebnis (Seq2Seq, {decoder})")
+    print(f"{'='*45}")
+    print(f"  Character Accuracy:         {(1-cer)*100:.2f}%")
+    print(f"  Word Accuracy:              {(1-wer)*100:.2f}%")
+    print(f"  Character Error Rate (CER): {cer*100:.2f}%")
+    print(f"  Word Error Rate     (WER):  {wer*100:.2f}%")
+    print(f"  Samples evaluiert:          {len(all_preds)}")
+    print(f"{'='*45}\n")
+
+    print("Beispiele:")
+    correct   = [(p, l) for p, l in zip(all_preds, all_labels) if p == l][:3]
+    incorrect = [(p, l) for p, l in zip(all_preds, all_labels) if p != l][:5]
+    for p, l in correct:
+        print(f"  ✓  GT: '{l}'  →  Pred: '{p}'")
+    for p, l in incorrect:
+        print(f"  ✗  GT: '{l}'  →  Pred: '{p}'")
+
+    return cer, wer
+
+
 # ── Standalone-Aufruf ─────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse
-    from src.dataset import get_dataloaders
+    from torch.utils.data import DataLoader
+    from src.dataset import (
+        IAMDataset, collate_fn, seq2seq_collate_fn, SEQ2SEQ_VOCAB,
+        get_dataloaders, get_seq2seq_dataloaders,
+    )
+    from src.model import build_seq2seq_model
 
     parser = argparse.ArgumentParser(description="HTR Evaluation")
     parser.add_argument("--checkpoint", required=True,  help="Pfad zum Modell-Checkpoint (.pt)")
-    parser.add_argument("--dataset",    default="synthetic", choices=["synthetic", "iam"])
+    parser.add_argument("--arch",       default="crnn", choices=["crnn", "seq2seq"])
+    parser.add_argument("--dataset",    default="iam", choices=["synthetic", "iam"])
     parser.add_argument("--data-dir",   default="data/raw")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--img-height", type=int, default=32)
-    parser.add_argument("--img-width",  type=int, default=128)
+    parser.add_argument("--img-width",  type=int, default=256)
+    parser.add_argument("--split",      default="test", choices=["val", "test"],
+                        help="Welcher Datensplit evaluiert wird (Standard: test = ungesehene Samples)")
+    parser.add_argument("--split-mode", default="random", choices=["random", "author"],
+                        help="MUSS zum Training passen! random (Standard) = Held-out-Samples derselben "
+                             "Schreiber. author nur sinnvoll, wenn auch mit --split-mode author trainiert wurde.")
     parser.add_argument("--decoder",    default="lm", choices=["greedy", "beam", "lm"],
-                        help="Decoder-Typ: greedy (schnell), beam (besser), lm (best, pyctcdecode)")
+                        help="CRNN: greedy/beam/lm. Seq2Seq: greedy oder beam (sonst beam).")
+    parser.add_argument("--deslant",    action="store_true",
+                        help="Deslanting (Fallback, falls nicht im Checkpoint vermerkt).")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    _, val_loader = get_dataloaders(
-        dataset_type=args.dataset,
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
-        img_height=args.img_height,
-        img_width=args.img_width,
-    )
+    # Checkpoint laden + lstm_hidden aus den Gewichten ableiten (wie in predict.py)
+    checkpoint  = torch.load(args.checkpoint, map_location=device)
+    sd          = checkpoint["model_state_dict"]
+    lstm_hidden = (sd["rnn.weight_hh_l0"].shape[0] // 4
+                   if "rnn.weight_hh_l0" in sd
+                   else checkpoint.get("lstm_hidden", 256))
 
-    model = build_model(img_height=args.img_height, num_classes=NUM_CLASSES)
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device)
+    # Config aus dem Checkpoint übernehmen, falls vorhanden (sonst CLI-Werte)
+    img_height = checkpoint.get("img_height", args.img_height)
+    img_width  = checkpoint.get("img_width",  args.img_width)
+    deslant    = checkpoint.get("deslant",    args.deslant)
+    print(f"Config: {img_height}x{img_width} | Deslant: {deslant} | Split: {args.split}/{args.split_mode}")
 
-    evaluate_model(model, val_loader, device, decoder=args.decoder)
+    # Passenden Dataloader für den gewählten Split bauen
+    if args.dataset == "iam":
+        is_seq2seq = args.arch == "seq2seq"
+        ds = IAMDataset(args.data_dir, split=args.split, img_height=img_height,
+                        img_width=img_width, split_mode=args.split_mode, deslant=deslant)
+        loader = DataLoader(
+            ds, batch_size=args.batch_size, shuffle=False,
+            collate_fn=(seq2seq_collate_fn if is_seq2seq else collate_fn),
+        )
+    else:
+        # Synthetische Daten kennen keinen test/author-Split → Val-Loader
+        if args.arch == "seq2seq":
+            _, loader = get_seq2seq_dataloaders(dataset_type="synthetic",
+                                                img_height=img_height, img_width=img_width, deslant=deslant)
+        else:
+            _, loader = get_dataloaders(dataset_type="synthetic",
+                                        img_height=img_height, img_width=img_width, deslant=deslant)
+
+    if args.arch == "seq2seq":
+        model = build_seq2seq_model(img_height=img_height, vocab_size=SEQ2SEQ_VOCAB,
+                                    lstm_hidden=lstm_hidden)
+        model.load_state_dict(sd)
+        model.to(device)
+        dec = "greedy" if args.decoder == "greedy" else "beam"
+        evaluate_seq2seq_model(model, loader, device, decoder=dec)
+    else:
+        model = build_model(img_height=img_height, num_classes=NUM_CLASSES,
+                            lstm_hidden=lstm_hidden)
+        model.load_state_dict(sd)
+        model.to(device)
+        evaluate_model(model, loader, device, decoder=args.decoder)

@@ -77,6 +77,7 @@ class IAMDataset(Dataset):
         img_width: int = 128,
         max_label_len: int = 32,
         split_mode: str = "random",  # "random" (80/10/10) oder "author" (offizielle IAM-Aufteilung)
+        deslant: bool = False,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.split = split
@@ -86,9 +87,9 @@ class IAMDataset(Dataset):
         self.split_mode = split_mode
 
         self.transform = (
-            get_train_transforms(img_height, img_width)
+            get_train_transforms(img_height, img_width, deslant=deslant)
             if split == "train"
-            else get_val_transforms(img_height, img_width)
+            else get_val_transforms(img_height, img_width, deslant=deslant)
         )
 
         self.samples: List[Tuple[Path, str]] = []
@@ -218,6 +219,7 @@ class SyntheticHTRDataset(Dataset):
         img_width: int = 128,
         split: str = "train",
         seed: int = 42,
+        deslant: bool = False,
     ) -> None:
         self.size = size
         self.img_height = img_height
@@ -225,9 +227,9 @@ class SyntheticHTRDataset(Dataset):
         self.split = split
 
         self.transform = (
-            get_train_transforms(img_height, img_width)
+            get_train_transforms(img_height, img_width, deslant=deslant)
             if split == "train"
-            else get_val_transforms(img_height, img_width)
+            else get_val_transforms(img_height, img_width, deslant=deslant)
         )
 
         # Reproduzierbare Zufallstexte generieren
@@ -315,6 +317,7 @@ def get_dataloaders(
     img_width: int = 128,
     num_workers: int = 4,
     synthetic_size: int = 5000,
+    deslant: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Erstellt DataLoader für Training und Validierung.
@@ -332,13 +335,13 @@ def get_dataloaders(
         (train_loader, val_loader)
     """
     if dataset_type == "iam":
-        train_ds = IAMDataset(data_dir, split="train", img_height=img_height, img_width=img_width, split_mode="random")
-        val_ds   = IAMDataset(data_dir, split="val",   img_height=img_height, img_width=img_width, split_mode="random")
+        train_ds = IAMDataset(data_dir, split="train", img_height=img_height, img_width=img_width, split_mode="random", deslant=deslant)
+        val_ds   = IAMDataset(data_dir, split="val",   img_height=img_height, img_width=img_width, split_mode="random", deslant=deslant)
     else:
         train_size = int(synthetic_size * 0.85)
         val_size   = synthetic_size - train_size
-        train_ds = SyntheticHTRDataset(train_size, img_height, img_width, split="train")
-        val_ds   = SyntheticHTRDataset(val_size,   img_height, img_width, split="val", seed=99)
+        train_ds = SyntheticHTRDataset(train_size, img_height, img_width, split="train", deslant=deslant)
+        val_ds   = SyntheticHTRDataset(val_size,   img_height, img_width, split="val", seed=99, deslant=deslant)
 
     train_loader = DataLoader(
         train_ds,
@@ -366,14 +369,15 @@ def get_seq2seq_dataloaders(
     img_height: int = 32,
     img_width: int = 128,
     num_workers: int = 4,
+    deslant: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
     """DataLoader für Seq2Seq-Training (BOS/EOS/PAD statt CTC-Format)."""
     if dataset_type == "iam":
-        train_ds = IAMDataset(data_dir, split="train", img_height=img_height, img_width=img_width, split_mode="random")
-        val_ds   = IAMDataset(data_dir, split="val",   img_height=img_height, img_width=img_width, split_mode="random")
+        train_ds = IAMDataset(data_dir, split="train", img_height=img_height, img_width=img_width, split_mode="random", deslant=deslant)
+        val_ds   = IAMDataset(data_dir, split="val",   img_height=img_height, img_width=img_width, split_mode="random", deslant=deslant)
     else:
-        train_ds = SyntheticHTRDataset(4250, img_height, img_width, split="train")
-        val_ds   = SyntheticHTRDataset(750,  img_height, img_width, split="val", seed=99)
+        train_ds = SyntheticHTRDataset(4250, img_height, img_width, split="train", deslant=deslant)
+        val_ds   = SyntheticHTRDataset(750,  img_height, img_width, split="val", seed=99, deslant=deslant)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               collate_fn=seq2seq_collate_fn, num_workers=num_workers, pin_memory=True)
