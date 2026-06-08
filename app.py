@@ -346,8 +346,11 @@ def load_model(checkpoint_path: str, arch: str, img_height: int, img_width: int)
 
 def predict_image(image: Image.Image, model, transform, device, arch: str = "crnn", decoder: str = "greedy"):
     img_gray = ensure_training_polarity(image)   # auf Trainings-Polarität bringen (sonst Kauderwelsch)
-    preprocessed_pil = img_gray.resize((256, 32), Image.LANCZOS)
-    tensor = transform(img_gray).unsqueeze(0).to(device)
+    proc = transform(img_gray)                    # (1,H,W) – exakt der Modell-Input (inkl. Deslant/Resize/Padding)
+    # Denormalisieren (mean/std = 0.5) und als Bild zur Anzeige – zeigt genau, was das Modell sieht
+    disp = (proc.squeeze(0) * 0.5 + 0.5).clamp(0, 1).mul(255).byte()
+    preprocessed_pil = Image.fromarray(disp.cpu().numpy())
+    tensor = proc.unsqueeze(0).to(device)
 
     if arch == "seq2seq":
         texts, confs = seq2seq_beam_decode(model, tensor, beam_width=5, return_confidence=True)
@@ -513,7 +516,7 @@ def main() -> None:
 
             st.markdown("<br>", unsafe_allow_html=True)
             if "prediction" in st.session_state:
-                st.markdown('<div class="section-label" style="margin-top:1rem; font-size:0.7rem;">Was das Modell sieht (32×256 px)</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="section-label" style="margin-top:1rem; font-size:0.7rem;">Was das Modell sieht ({info.get("img_height", img_height)}×{info.get("img_width", img_width)} px)</div>', unsafe_allow_html=True)
                 st.image(st.session_state["prediction"]["preprocessed"], use_container_width=True)
 
             st.markdown("<br>", unsafe_allow_html=True)
