@@ -115,7 +115,7 @@ AKI_HTA/
 ├── src/
 │   ├── model.py          ← CRNN + CRNN_Seq2Seq Architekturen
 │   ├── dataset.py        ← IAM-Datensatz, synthetische Daten, BOS/EOS/PAD tokens
-│   └── transforms.py     ← Bildvorverarbeitung und Augmentation
+│   └── transforms.py     ← Vorverarbeitung: Polarität, Deslanting, Augmentation
 │
 ├── training/
 │   └── train.py          ← Trainer (CTC) + Seq2SeqTrainer (Teacher Forcing), --arch Flag
@@ -129,9 +129,11 @@ AKI_HTA/
 │   └── visualization.py  ← Trainingskurven und Beispielplots
 │
 ├── outputs/
-│   ├── checkpoints/      ← best_model.pt (CRNN), best_seq2seq.pt (Seq2Seq)
+│   ├── checkpoints/      ← best_model.pt (CRNN), best_seq2seq.pt (Seq2Seq), *_BASELINE_* (Backup)
 │   └── logs/             ← Trainingskurven, TensorBoard-Logs, history.json
 │
+├── tools/
+│   └── compare_heights.py← Diagnose: Bilddetail bei Höhe 32 vs 48 vs 64 vergleichen
 ├── predict.py            ← Vorhersage: --arch crnn oder --arch seq2seq
 ├── app.py                ← Web-Demo (Streamlit) mit Architektur-Auswahl
 ├── ANLEITUNG.md          ← Schritt-für-Schritt Workflow
@@ -148,7 +150,23 @@ AKI_HTA/
   - **Weniger Beschneidung.** Bei 128px wurden lange Wörter rechts abgeschnitten (`ResizeToHeight`), während das Label vollständig blieb → unlernbare Zeichen. 256px fasst die meisten IAM-Wörter ohne Verlust.
   - **Die Breite ändert keine Gewichts-Shapes** (nur die Höhe tut das) — bestehende Checkpoints lassen sich mit `--img-width 256` ohne Neustart weitertrainieren.
 
-> **Wichtig:** Training und Inferenz (`predict.py`, `app.py`) müssen dieselbe Breite verwenden, sonst sieht das Modell bei der Vorhersage eine andere Stauchung als beim Training.
+> **Wichtig:** Training und Inferenz (`predict.py`, `app.py`) müssen dieselbe Breite verwenden, sonst sieht das Modell bei der Vorhersage eine andere Stauchung als beim Training. Da Bildgröße und Deslant im Checkpoint gespeichert werden, geschieht das automatisch.
+
+> **Experiment 48×384 + Deslanting:** `train_loop.ps1` startet einen frischen Lauf mit Höhe 48, Breite 384 und Deslanting (Schräglagen-Korrektur), um die letzten Prozentpunkte zu holen. Da die Höhe die Gewichts-Shapes ändert, ist das ein Neustart von 0; das 32×256-Modell bleibt als Backup erhalten.
+
+---
+
+## Bild-Vorverarbeitung (Polarität & Deslanting)
+
+### Polarität – warum Uploads sonst scheitern
+Das IAM-Training **invertiert** die Bilder (`ImageOps.invert`): das Modell lernt also **helle Schrift auf dunklem Grund**. Ein normales Foto/Scan ist aber **dunkle Schrift auf hellem Grund** — die umgekehrte Polarität. Ohne Korrektur sieht das Modell bei Uploads das „Negativ" und liefert Kauderwelsch, obwohl es auf IAM exzellent abschneidet.
+
+`ensure_training_polarity()` ([transforms.py](src/transforms.py)) löst das: Es erkennt am Median-Pixel, ob der Hintergrund hell ist, und invertiert dann auf die Trainings-Polarität. Angewendet in `predict.py` und `app.py` (die Bilder direkt laden). `evaluate.py` braucht es **nicht** — dort kommen die Bilder über `IAMDataset`, das bereits invertiert.
+
+→ **Für Uploads gilt:** schwarze Schrift auf hellem Grund, einzelnes Wort, eng zugeschnitten. Die Korrektur passiert automatisch.
+
+### Deslanting (`--deslant`)
+Optionale Schräglagen-Korrektur (Vinciarelli-Luettin-Heuristik): Das Bild wird über mehrere Scherwinkel getestet; gewählt wird der Winkel, der die Tinte am stärksten in senkrechte Spalten konzentriert. Das richtet kursive Schrift auf und reduziert Form-Verwechslungen (o/c, B/s, t/r). Wird im Checkpoint vermerkt und muss bei Training und Inferenz identisch sein (geschieht automatisch über die Checkpoint-Metadaten).
 
 ---
 
@@ -188,7 +206,7 @@ python predict.py --image mein_bild.png --checkpoint outputs/checkpoints/best_se
 python predict.py --folder data/sample_images/ --checkpoint outputs/checkpoints/best_model.pt
 ```
 
-Das Bild sollte ein **einzelnes handgeschriebenes Wort** auf hellem Hintergrund zeigen.
+Das Bild sollte ein **einzelnes handgeschriebenes Wort**, **dunkle Schrift auf hellem Grund**, eng zugeschnitten zeigen. Polarität, Bildgröße und Deslant werden automatisch aus dem Checkpoint bzw. per Hintergrund-Erkennung gesetzt — keine Flags nötig.
 
 ### Web-Demo
 
@@ -201,7 +219,7 @@ Browser öffnet sich unter `http://localhost:8501`. In der Sidebar kann man zwis
 ### Evaluation
 
 ```powershell
-# Ehrliche Endzahl: Test-Set + ungesehene Schreiber (Standard)
+# Test-Set (ungesehene Samples), passend zum random-Training
 python -m evaluation.evaluate --checkpoint outputs/checkpoints/best_model.pt --dataset iam --data-dir data/raw
 
 # Seq2Seq mit Beam Search
@@ -267,6 +285,9 @@ Beam Search korrigiert frühe Fehlentscheidungen, die Greedy nicht mehr revidier
 - **LR-Warmup:** linearer Anstieg über die ersten `--warmup-steps` (Standard 500) Schritte, stabilisiert den instabilen Transformer-Start. Nur bei Neustart, nicht beim Resume (dort ist die LR bereits eingependelt)
 - **Scheduler:** `ReduceLROnPlateau` halbiert die LR bei stagnierender Val-Loss
 - **Label Smoothing 0.1** (nur Seq2Seq): gegen Übervertrauen
+- **EMA (Exponential Moving Average):** ein gleitender Mittelwert der Gewichte (Decay 0.999, `--no-ema` schaltet ab). Für Validierung **und** den gespeicherten Checkpoint werden die geglätteten EMA-Gewichte genutzt — meist etwas besser als die zuletzt trainierten. `best_seq2seq.pt`/`best_model.pt` enthalten also die EMA-Gewichte.
+- **Train-CER:** wird über mehrere Batches gemittelt (verlässlicher als 1 Batch); **Val-CER** läuft mit Greedy über den ganzen Val-Satz (schnell, rankt Epochen wie Beam). Beam wird gezielt fürs finale Eval/Inferenz genutzt.
+- **Selbst-konfigurierende Checkpoints:** `img_height`, `img_width` und `deslant` werden im Checkpoint gespeichert. `predict.py`, `app.py` und `evaluate.py` lesen sie automatisch — kein manuelles Setzen von Bildgröße/Deslant nötig.
 
 ## GPU-Optimierungen
 
@@ -290,6 +311,7 @@ Browser: `http://localhost:6006` – zeigt Loss und CER in Echtzeit für beide A
 ## Wichtige Hinweise
 
 - Das Modell erkennt **einzelne Wörter**, keine ganzen Sätze
+- **Upload-Bilder:** dunkle Schrift auf hellem Grund, einzelnes Wort, eng zugeschnitten — die Polarität wird automatisch korrigiert (`ensure_training_polarity`), sonst kommt Kauderwelsch
 - Modelldateien (`.pt`) sind zu groß für Git – lokal aufbewahren
 - Bei Trainingsunterbrechung immer `--resume` verwenden um Fortschritt nicht zu verlieren
 - Seq2Seq braucht mehr Epochen bis es konvergiert (Patience 15 statt 10 empfohlen)
